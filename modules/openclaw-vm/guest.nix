@@ -308,16 +308,15 @@ in
         (lib.concatStringsSep "," cfg.tailscale.advertiseTags)
       ];
       # Note: exitNode is set separately after connect (see tailscale-post-connect service)
-      # Use persistent volume for state (survives VM rebuilds)
-      extraDaemonFlags = [ "--state=/var/lib/openclaw/tailscale/tailscaled.state" ];
+      # Ephemeral state: no persistent state file. Each boot re-auths with ephemeral key.
+      # This avoids ghost nodes from --force-reauth creating a new identity while the
+      # old identity persists in the state file.
     };
 
     # Configure tailscaled to read auth key from fw_cfg credential
     systemd.services.tailscaled = lib.mkIf cfg.tailscale.enable {
       serviceConfig = {
         LoadCredential = [ "tailscale-authkey" ];
-        # State in persistent volume, not default /var/lib/tailscale
-        StateDirectory = lib.mkForce "";
       };
     };
 
@@ -414,18 +413,6 @@ in
         echo "Timeout waiting for Tailscale Serve to configure"
         exit 1
       '';
-    };
-
-    # Security: Tailscale state directory with strict permissions
-    # Prevents openclaw user from reading node keys
-    systemd.tmpfiles.settings."10-tailscale" = lib.mkIf cfg.tailscale.enable {
-      "/var/lib/openclaw/tailscale" = {
-        d = {
-          mode = "0700";
-          user = "root";
-          group = "root";
-        };
-      };
     };
 
     # Shared group for workspace access - both users can read/write workspace files
