@@ -437,7 +437,10 @@ in
         specialArgs = { inherit pkgs-unstable nix-openclaw opencode; };
 
         config = { config, ... }: {
-          imports = [ ./guest.nix ];
+          imports = [
+            ./guest.nix
+            ../credential-proxy/guest.nix
+          ];
 
           CUSTOM.virtualisation.openclaw-vm.guest = {
             vcpu = cfg.vcpu;
@@ -464,6 +467,12 @@ in
               exitNode = cfg.tailscale.exitNode;
               serve.enable = cfg.tailscale.serve.enable;
               sshAuthorizedKeys = cfg.tailscale.sshAuthorizedKeys;
+            };
+            # Pass credential proxy config to guest
+            credentialProxy = lib.mkIf cfg.credentialProxy.enable {
+              enable = true;
+              vsockPort = cfg.credentialProxy.vsockPort;
+              caCertFile = cfg.credentialProxy.caCertPath;
             };
           };
         };
@@ -544,6 +553,36 @@ in
         config.microvm.credentialFiles = {
           "tailscale-authkey" = config.sops.secrets."openclaw/tailscale-authkey".path;
         };
+      };
+    })
+
+    # Network lockdown when credential proxy is enabled
+    # Drops all new VM outbound connections — internet access must go through
+    # VSOCK → credential proxy on the host. VSOCK is a virtio device (not a
+    # network interface), so it is unaffected by nftables.
+    (mkIf (cfg ? credentialProxy && cfg.credentialProxy.enable) {
+      networking.nftables.tables.credproxy-lockdown = {
+        family = "inet";
+        content = let
+          bridgeAddr = lib.head (lib.splitString "/" cfg.network.bridgeAddress);
+        in ''
+          chain forward {
+            type filter hook forward priority 0; policy accept;
+
+            # Pass through non-VM traffic immediately
+            iifname != "${cfg.network.bridgeName}" accept
+
+            # Allow established/related connections (return traffic)
+            ct state established,related accept
+
+            # Allow DNS from VM to host bridge
+            ip daddr ${bridgeAddr} udp dport 53 accept
+            ip daddr ${bridgeAddr} tcp dport 53 accept
+
+            # DROP all new outbound connections from the VM
+            drop
+          }
+        '';
       };
     })
 

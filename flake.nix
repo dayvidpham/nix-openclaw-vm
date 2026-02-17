@@ -15,9 +15,13 @@
       url = "github:anomalyco/opencode";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    credential-proxy = {
+      url = "path:./credential-proxy";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, microvm, nix-openclaw, opencode }: let
+  outputs = { self, nixpkgs, microvm, nix-openclaw, opencode, credential-proxy }: let
     system = "x86_64-linux";
     pkgs = import nixpkgs { inherit system; };
   in {
@@ -25,9 +29,15 @@
       openclaw = ./modules/openclaw;
       openclaw-vm = ./modules/openclaw-vm;
       openclaw-vm-guest = ./modules/openclaw-vm/guest.nix;
+      credential-proxy = { imports = [
+        ./modules/credential-proxy
+      ]; _module.args.credential-proxy = credential-proxy; };
+      credential-proxy-guest = ./modules/credential-proxy/guest.nix;
+      credential-proxy-openbao = ./modules/credential-proxy/openbao-policy.nix;
       default = { imports = [
         self.nixosModules.openclaw
         self.nixosModules.openclaw-vm
+        self.nixosModules.credential-proxy
       ]; };
     };
 
@@ -35,11 +45,12 @@
       inherit system;
       specialArgs = {
         pkgs-unstable = pkgs;
-        inherit nix-openclaw opencode;
+        inherit nix-openclaw opencode credential-proxy;
       };
       modules = [
         microvm.nixosModules.host
         self.nixosModules.openclaw-vm
+        self.nixosModules.credential-proxy
         {
           CUSTOM.virtualisation.openclaw-vm = {
             enable = true;
@@ -69,8 +80,13 @@
       ];
     };
 
-    packages.${system}.test-vm =
-      self.nixosConfigurations.test-vm.config.microvm.vms.openclaw-vm.config.config.microvm.declaredRunner;
+    devShells.${system}.default = credential-proxy.devShells.${system}.default;
+
+    packages.${system} = {
+      credential-proxy = credential-proxy.packages.${system}.credential-proxy;
+      test-vm =
+        self.nixosConfigurations.test-vm.config.microvm.vms.openclaw-vm.config.config.microvm.declaredRunner;
+    };
 
     checks.${system}.eval-test-vm = let
       toplevel = self.nixosConfigurations.test-vm.config.system.build.toplevel;

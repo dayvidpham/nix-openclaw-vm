@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "credential-proxy": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "path": "./credential-proxy",
+        "type": "path"
+      },
+      "original": {
+        "path": "./credential-proxy",
+        "type": "path"
+      },
+      "parent": []
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -155,6 +171,7 @@
     },
     "root": {
       "inputs": {
+        "credential-proxy": "credential-proxy",
         "microvm": "microvm",
         "nix-openclaw": "nix-openclaw",
         "nixpkgs": "nixpkgs_2",
