@@ -119,6 +119,41 @@ The **Response** process models `handleResponse`:
   metadata).  This property is enforced by construction in the code and not
   directly modeled as a state transition.
 
+## TLA+ model-first development rule
+
+The TLA+ model is the **source of truth** for the concurrency protocol. Any change to the protocol — new states, new actors, changed channel semantics, modified timeouts, added signal paths — MUST be modeled and verified in TLA+ **before** the corresponding Go code is written.
+
+**Workflow for protocol changes:**
+
+1. Update the PlusCal spec in `proxy_protocol.tla`
+2. Run `pcal proxy_protocol.tla` to regenerate the TLA+ translation
+3. Run `tlc proxy_protocol.tla -config proxy_protocol.cfg` and confirm zero violations
+4. Update the correspondence table below if new actors, variables, or files are involved
+5. Implement the Go code to match the verified model
+6. Update the "What to update" checklist if a new trigger category was introduced
+
+This ordering exists because TLC exhaustively checks all reachable states. A protocol bug caught at the model level costs minutes; the same bug caught in production costs hours or worse. Writing Go first and back-fitting the model defeats the purpose of formal verification.
+
+### Actor-to-file correspondence
+
+Changes to these Go files likely affect the protocol model. If your change touches the **Protocol-relevant code** column, check whether the TLA+ model needs updating.
+
+| TLA+ Actor | TLA+ Labels | Go File(s) | Protocol-relevant code |
+|------------|-------------|------------|----------------------|
+| `Handler` | `h_register`, `h_start_workflow`, `h_wait_decision`, `h_cleanup` | `proxy/handlers.go` | `handleRequest`: registry Store, ExecuteWorkflow, `select` on DecisionCh, `defer registry.Delete` |
+| `Workflow` | `w_activities`, `w_wait_signal` | `workflows/proxy_workflow.go`, `workflows/activities.go` | `ProxyRequestWorkflow`: activity sequencing, signal wait. `FetchAndInject`/`SendDecision`: DecisionCh sends |
+| `Response` | `r_check`, `r_signal` | `proxy/handlers.go` | `handleResponse`: scrub-and-signal path, `SignalWorkflow` call |
+
+### TLA+ variable-to-Go mapping
+
+| TLA+ Variable | Go Counterpart | File |
+|---------------|----------------|------|
+| `reg` | `Gateway.registry` (sync.Map lifecycle) | `proxy/handlers.go` |
+| `decCh` | `RequestContext.DecisionCh` (buffered chan, cap=1) | `workflows/activities.go` |
+| `decChWrites` | Implicit — enforced by single-send discipline in `FetchAndInject`/`SendDecision` | `workflows/activities.go` |
+| `handlerDone` | Handler goroutine return (goproxy sequences OnRequest → OnResponse) | `proxy/handlers.go` |
+| `respSig` | `SignalResponseComplete` via `temporal.SignalWorkflow` | `proxy/handlers.go`, `workflows/activities.go` |
+
 ## What to update when the protocol changes
 
 Re-run the full workflow (`pcal` then `tlc`) after changing:

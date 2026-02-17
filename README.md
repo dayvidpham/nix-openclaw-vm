@@ -61,6 +61,19 @@ The tests are organized by package:
 
 The `proxy` tests spin up real `httptest` servers and a real `Gateway` instance. They mock only external dependencies (`authn.Verifier`, `vault.SecretStore`, Temporal client) — the system under test is the gateway itself.
 
+### TLA+ formal concurrency model
+
+The credential-proxy's concurrency protocol (Handler, Workflow, and Response actors communicating via a buffered decision channel and Temporal signals) is formally modeled in TLA+/PlusCal. TLC exhaustively verifies safety invariants (no double-write on the decision channel) and liveness properties (handler always terminates, registry always cleaned up) across all reachable states.
+
+**The TLA+ model is the source of truth for protocol design.** Protocol changes must be modeled and verified in TLA+ before Go code is written. Run the model checker from the dev shell:
+
+```bash
+cd credential-proxy
+pcal model/proxy_protocol.tla && tlc model/proxy_protocol.tla -config model/proxy_protocol.cfg
+```
+
+For the full model documentation — verified properties, actor descriptions, abstraction rationale, actor-to-file correspondence, variable mapping, and the change trigger checklist — see [`credential-proxy/model/README.md`](credential-proxy/model/README.md).
+
 ### Dev shell (iterating on credential-proxy)
 
 Enter the dev shell to get Go toolchain, `gopls`, `staticcheck`, `delve`, and `temporal-cli`:

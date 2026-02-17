@@ -128,6 +128,21 @@ The `test-vm` config has `dangerousDevMode` enabled and sops/Tailscale/Caddy dis
 | `authz` | Integration | OPA evaluator against the **real** Rego policy (`authz/policies/`). Tests allow/deny decisions, domain binding enforcement, role requirements. |
 | `authn` | Unit | OIDC error classification (`ErrTokenExpired`, `ErrInvalidIssuer`, `ErrInvalidAudience`) and Keycloak `realm_access.roles` extraction. |
 
+### TLA+ formal model
+
+The TLA+/PlusCal model in `credential-proxy/model/` formally verifies the concurrency protocol between the Handler, Workflow, and Response actors. It is the **source of truth** for protocol design.
+
+**Model-first rule:** Any change to the concurrency protocol MUST be modeled and verified in TLA+ **before** the corresponding Go code is written. Agents that refactor protocol-relevant code MUST run `pcal` + `tlc` as a quality gate before committing.
+
+**Validation command** (from `credential-proxy/`, inside the dev shell):
+```bash
+pcal model/proxy_protocol.tla && tlc model/proxy_protocol.tla -config model/proxy_protocol.cfg
+```
+
+Expected output: `Model checking completed. No error has been found.`
+
+For the full model documentation — actor-to-file correspondence, variable mapping, change triggers, and the protocol change workflow — see [`credential-proxy/model/README.md`](credential-proxy/model/README.md).
+
 ### Type safety rules
 
 - **No stringly-typed APIs.** All status codes, denial reasons, decision types, signal names, and error categories MUST be strongly-typed Go enums (`type Foo int` with `iota` constants). String representations are only acceptable at serialization boundaries (JSON, Temporal search attributes, HTTP responses) via `.String()` methods.
@@ -216,6 +231,71 @@ All implementation plans, slices, and code changes must be reviewed against thes
 - **Do not over-engineer.** If the problem has 3 moving parts, the solution should have ~3 moving parts. Premature abstractions, plugin systems, and configurability for hypothetical futures add cost without value.
 - **Do not under-engineer.** If the problem is inherently complex (e.g., MITM TLS + credential injection + response scrubbing + audit), the solution should match that complexity. Cutting corners on security or correctness to reduce code is not simplicity.
 - **Complexity should be proportional to the innate complexity of the problem domain**, not to the amount of code written. Three similar lines are better than a premature abstraction. But a genuine 5-component pipeline deserves 5 clear components.
+
+## Agent Orchestration
+
+This project uses two external tools for multi-agent coordination. Both live in `~/codebases/dayvidpham/aura-scripts/`.
+
+### aura-swarm — Epic-based worktree workflow
+
+Creates an isolated git worktree for an epic, gathers beads task context, and launches a single Claude instance (in a tmux session) that uses Agent Teams internally to coordinate workers.
+
+```bash
+~/codebases/dayvidpham/aura-scripts/aura-swarm start --epic <epic-id> --model sonnet
+~/codebases/dayvidpham/aura-scripts/aura-swarm status
+~/codebases/dayvidpham/aura-scripts/aura-swarm attach <epic-id>
+~/codebases/dayvidpham/aura-scripts/aura-swarm stop <epic-id>
+~/codebases/dayvidpham/aura-scripts/aura-swarm merge <epic-id>
+~/codebases/dayvidpham/aura-scripts/aura-swarm cleanup <epic-id>
+```
+
+Branch model:
+```
+main
+ └── epic/<epic-id>                 (aura-swarm creates this branch + worktree)
+       ├── agent/<task-id-1>         (Claude's Agent Teams creates these)
+       ├── agent/<task-id-2>
+       └── agent/<task-id-3>
+```
+
+### launch-parallel.py — Ad-hoc parallel agent launches
+
+Launches parallel Claude agents in tmux sessions with role-based instructions from `~/.claude/commands/aura:{role}.md`.
+
+```bash
+# Launch 3 reviewers
+~/codebases/dayvidpham/aura-scripts/launch-parallel.py --role reviewer -n 3 --prompt "Review plan..."
+
+# Launch supervisor with task IDs
+~/codebases/dayvidpham/aura-scripts/launch-parallel.py --role supervisor -n 1 \
+  --task-id id1 --task-id id2 --prompt "Coordinate these tasks"
+
+# Launch with skill invocation
+~/codebases/dayvidpham/aura-scripts/launch-parallel.py --role reviewer -n 3 \
+  --skill aura:reviewer:review-plan --prompt "Review plan aura-xyz"
+
+# Dry run (show commands without executing)
+~/codebases/dayvidpham/aura-scripts/launch-parallel.py --role supervisor -n 1 --prompt "..." --dry-run
+```
+
+### Role instruction files
+
+Both tools load role instructions from `.claude/commands/aura:{role}.md`:
+1. Check the project's `.claude/commands/` directory first
+2. Fall back to `~/.claude/commands/`
+
+Available roles: `architect`, `supervisor`, `reviewer`, `worker`
+
+### Inter-agent communication
+
+Agents coordinate through **beads** (not a dedicated messaging CLI):
+```bash
+bd comments add <task-id> "Status update: ..."      # Add comments to shared tasks
+bd update <task-id> --notes="Blocked on X"           # Update task notes
+bd show <task-id>                                    # Read task state
+bd update <task-id> --status=in_progress             # Claim work
+bd close <task-id>                                   # Signal completion
+```
 
 ## Landing the Plane (Session Completion)
 
