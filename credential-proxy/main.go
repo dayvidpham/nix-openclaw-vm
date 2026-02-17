@@ -15,7 +15,7 @@ import (
 	temporalclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
 
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/auth"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/proxy"
@@ -51,7 +51,7 @@ func run(args []string) error {
 	slog.Info("config loaded", "path", *configPath)
 
 	// Initialize OIDC verifier.
-	verifier, err := auth.NewOIDCVerifier(ctx, cfg.OIDC)
+	verifier, err := authn.NewOIDCVerifier(ctx, cfg.OIDC)
 	if err != nil {
 		return fmt.Errorf("init OIDC verifier: %w", err)
 	}

@@ -79,7 +79,7 @@ func (gw *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*htt
 	req.Header.Del("Proxy-Authorization")
 
 	// Verify JWT → agent identity.
-	identity, err := gw.auth.VerifyToken(bgCtx, rawToken)
+	identity, err := gw.authn.VerifyToken(bgCtx, rawToken)
 	if err != nil {
 		slog.Warn("token verification failed", "error", err)
 		return req, errorResponse(req, http.StatusForbidden, "token verification failed")

@@ -24,7 +24,7 @@ import (
 
 	temporalclient "go.temporal.io/sdk/client"
 
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/auth"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
@@ -35,11 +35,11 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockVerifier struct {
-	identity *auth.AgentIdentity
+	identity *authn.AgentIdentity
 	err      error
 }
 
-func (m *mockVerifier) VerifyToken(_ context.Context, _ string) (*auth.AgentIdentity, error) {
+func (m *mockVerifier) VerifyToken(_ context.Context, _ string) (*authn.AgentIdentity, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
@@ -86,7 +86,7 @@ func (m *mockTemporalClient) ExecuteWorkflow(_ context.Context, _ temporalclient
 
 // Compile-time interface satisfaction checks.
 var (
-	_ auth.Verifier          = (*mockVerifier)(nil)
+	_ authn.Verifier          = (*mockVerifier)(nil)
 	_ authz.Evaluator        = (*mockEvaluator)(nil)
 	_ vault.SecretStore      = (*mockStore)(nil)
 	_ temporalclient.Client  = (*mockTemporalClient)(nil)
@@ -192,7 +192,7 @@ credentials:
 
 // startGateway creates a Gateway, starts serving on a random port, and returns
 // the listener address. The listener is closed via t.Cleanup.
-func startGateway(t *testing.T, cfg *config.Config, v auth.Verifier, e authz.Evaluator, s vault.SecretStore) string {
+func startGateway(t *testing.T, cfg *config.Config, v authn.Verifier, e authz.Evaluator, s vault.SecretStore) string {
 	t.Helper()
 
 	gw, err := NewGateway(cfg, v, e, s, &mockTemporalClient{})
@@ -225,7 +225,7 @@ func gwProxyClient(t *testing.T, proxyAddr string) *http.Client {
 
 func defaultMockVerifier() *mockVerifier {
 	return &mockVerifier{
-		identity: &auth.AgentIdentity{
+		identity: &authn.AgentIdentity{
 			Subject:   "agent-001",
 			RawClaims: map[string]interface{}{"sub": "agent-001"},
 		},

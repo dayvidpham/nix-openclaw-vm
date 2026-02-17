@@ -9,7 +9,7 @@ import (
 	"github.com/elazarl/goproxy"
 	temporalclient "go.temporal.io/sdk/client"
 
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/auth"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
@@ -20,7 +20,7 @@ import (
 // a goproxy MITM proxy.
 type Gateway struct {
 	cfg      *config.Config
-	auth     auth.Verifier
+	authn    authn.Verifier
 	authz    authz.Evaluator
 	vault    vault.SecretStore
 	proxy    *goproxy.ProxyHttpServer
@@ -36,7 +36,7 @@ type Gateway struct {
 var _ http.Handler = (*Gateway)(nil)
 
 // NewGateway constructs a fully-wired Gateway and registers goproxy handlers.
-func NewGateway(cfg *config.Config, authV auth.Verifier, authzE authz.Evaluator, vaultS vault.SecretStore, tc temporalclient.Client) (*Gateway, error) {
+func NewGateway(cfg *config.Config, authV authn.Verifier, authzE authz.Evaluator, vaultS vault.SecretStore, tc temporalclient.Client) (*Gateway, error) {
 	// Load MITM CA certificate if configured.
 	if cfg.CACertPath != "" && cfg.CAKeyPath != "" {
 		ca, err := tls.LoadX509KeyPair(cfg.CACertPath, cfg.CAKeyPath)
@@ -48,7 +48,7 @@ func NewGateway(cfg *config.Config, authV auth.Verifier, authzE authz.Evaluator,
 
 	gw := &Gateway{
 		cfg:      cfg,
-		auth:     authV,
+		authn:    authV,
 		authz:    authzE,
 		vault:    vaultS,
 		proxy:    goproxy.NewProxyHttpServer(),
