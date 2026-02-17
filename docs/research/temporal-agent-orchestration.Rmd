@@ -1,0 +1,394 @@
+---
+title: "Temporal Agent Orchestration - Access Decision Pipeline Patterns"
+date: "2026-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+## Executive Summary
+
+This report surveys the Temporal ecosystem for projects using durable workflows in domains relevant to our credential proxy: agent orchestration, access control pipelines, credential/secret management, and security-sensitive tool execution. The research draws from the [awesome-temporal](https://github.com/temporalio/awesome-temporal) curated list, the [temporal-community](https://github.com/orgs/temporal-community/repositories) GitHub org, and broader ecosystem projects.
+
+**Central finding:** No existing project combines Temporal with a forward proxy for credential injection. However, three clear patterns emerge from the ecosystem that directly inform our architecture:
+
+1. **Workflow-as-orchestrator for access decisions** — wrapping authn → authz → credential resolution as a Temporal workflow with tool calls as activities (temporal-ai-agent, durable-mcp)
+2. **JIT credential delivery via Vault activities** — Temporal workers request short-lived credentials from Vault scoped to the workflow's identity (Vault+Temporal pattern, codecserver)
+3. **Signal-driven human-in-the-loop gates** — workflows pause for approval before executing privileged operations (temporal-ai-agent confirm signal)
+
+**Key projects analyzed:**
+
+| Project | Language | Stars | License | Relevance |
+|---------|----------|-------|---------|-----------|
+| [temporal-ai-agent](https://github.com/temporal-community/temporal-ai-agent) | Python | 628 | MIT | Canonical agent orchestration pattern |
+| [durable-mcp](https://github.com/temporal-community/durable-mcp) | Python | 13 | MIT | External calls as durable activities |
+| [ai-iceberg-demo](https://github.com/temporal-community/ai-iceberg-demo) | Python | 4 | MIT | Auth0 identity + Temporal workflows |
+| [mcp-agent](https://github.com/lastmile-ai/mcp-agent) | Python | 8000 | Apache-2.0 | Temporal as durable execution backend |
+| [codecserver](https://github.com/zboralski/codecserver) | Go | — | — | Vault Transit encryption for Temporal data |
+| [cognosisai/platform](https://github.com/cognosisai/platform) | Python | — | — | LLM application template on Temporal |
+
+---
+
+## Pattern 1: Workflow-as-Orchestrator (temporal-ai-agent)
+
+### Architecture
+
+The `temporal-community/temporal-ai-agent` project (628 stars, MIT, Python) implements the canonical pattern for running an AI agent inside a Temporal workflow. The `AgentGoalWorkflow` class wraps the entire agent loop — LLM reasoning, tool selection, tool execution, and user interaction — as a durable workflow.
+
+```python
+@workflow.defn
+class AgentGoalWorkflow:
+    """Manages tool execution with user confirmation and conversation history."""
+
+    def __init__(self):
+        self.conversation_history = []
+        self.prompt_queue = deque()
+        self.tool_data = None
+        self.confirmed = False
+        self.goal = None
+
+    @workflow.run
+    async def run(self, goal: AgentGoal) -> str:
+        # Main loop: wait for signals, execute activities
+        while True:
+            await workflow.wait_condition(
+                lambda: bool(self.prompt_queue) or self.chat_ended or self.confirmed
+            )
+            if self.chat_ended:
+                break
+            if self.confirmed:
+                await self.execute_confirmed_tool()
+            elif self.prompt_queue:
+                prompt = self.prompt_queue.popleft()
+                await self.process_user_prompt(prompt)
+
+    @workflow.signal
+    async def user_prompt(self, prompt: str):
+        self.prompt_queue.append(prompt)
+
+    @workflow.signal
+    async def confirm(self):
+        self.confirmed = True
+```
+
+### Key Design Decisions
+
+1. **Activities for all external calls.** LLM inference, tool execution, prompt validation — every I/O operation is an activity. The workflow itself is deterministic.
+
+2. **Signal-driven interaction.** User prompts, confirmations, and configuration changes arrive as workflow signals. The workflow blocks on `wait_condition` until a signal arrives.
+
+3. **Query handlers for state inspection.** `get_conversation_history()`, `get_agent_goal()`, `get_latest_tool_data()` expose workflow state without mutation.
+
+4. **Tool execution requires confirmation.** Before executing a tool, the workflow stores tool parameters in `self.tool_data` and waits for a `confirm` signal. This is the human-in-the-loop (HITL) gate.
+
+### What We Take
+
+The **workflow-as-orchestrator** pattern maps directly to our access decision pipeline:
+
+| temporal-ai-agent | credential-proxy |
+|-------------------|-----------------|
+| `user_prompt` signal | HTTP request arrives at goproxy |
+| `agent_validatePrompt` activity | `ValidateIdentity` activity (JWT verification) |
+| `agent_toolPlanner` activity | `EvaluatePolicy` activity (OPA authz) |
+| `handle_tool_execution` activity | `ResolveCredentialPaths` activity (vault lookup) |
+| `confirm` signal (HITL gate) | Domain binding check (automated gate) |
+| `get_conversation_history` query | `GetAuditTrail` query |
+
+The critical insight is that the workflow **does not perform the actual work** — it orchestrates activities and gates. In our case, goproxy performs the actual HTTP forwarding; the Temporal workflow orchestrates the access decision.
+
+---
+
+## Pattern 2: Durable External Calls (durable-mcp)
+
+### Architecture
+
+The `temporal-community/durable-mcp` project (13 stars, MIT, Python) demonstrates wrapping MCP server tool calls as Temporal activities to make them resilient to network failures, process crashes, and temporary service unavailability.
+
+```
+MCP Client (Claude Desktop / CLI)
+    ↓ MCP protocol
+Protocol Handler (mcp_servers/weather.py)
+    ↓ starts workflow
+Temporal Workflow (workflows/weather_workflows.py)
+    ↓ executes activity
+Temporal Activity (workflows/weather_activities.py)
+    ↓ HTTP call
+External API (National Weather Service)
+```
+
+### Key Design Decisions
+
+1. **Every external call is an activity.** API requests, web scraping, any I/O that can fail gets wrapped in an activity with retry policies.
+
+2. **Workflows orchestrate activity sequences.** The workflow defines the order of operations deterministically.
+
+3. **Protocol handlers bridge to Temporal.** The MCP protocol handler translates between the MCP client protocol and Temporal workflow execution.
+
+### What We Take
+
+The **bridge pattern** — protocol handler → workflow → activities → external services — maps to:
+
+```
+goproxy CONNECT handler (protocol handler)
+    ↓ starts workflow
+ProxyAccessDecision workflow
+    ↓ executes activities
+ValidateIdentity → EvaluatePolicy → ResolveCredentialPaths
+    ↓ returns decision
+goproxy applies credentials and forwards
+```
+
+The protocol handler (goproxy) does not call external services directly for the access decision. It starts a Temporal workflow and waits for the result. The workflow guarantees that every step (authn, authz, vault lookup) completes or fails cleanly.
+
+---
+
+## Pattern 3: JIT Credential Delivery (Vault + Temporal)
+
+### Architecture
+
+Multiple sources document a **just-in-time credential delivery model** where Temporal workers request short-lived credentials from Vault scoped to the workflow's identity. This is described in [Hoop.dev's Vault+Temporal guide](https://hoop.dev/blog/how-to-configure-hashicorp-vault-temporal-for-secure-repeatable-access) and implemented in the [codecserver](https://github.com/zboralski/codecserver) project.
+
+The pattern:
+
+1. Temporal worker authenticates to Vault using OIDC or AppRole
+2. Workflow activity requests credentials scoped to the workflow's identity
+3. Vault issues short-lived credentials mapped to the worker's role
+4. Credentials are consumed within the activity and not persisted to event history
+5. On workflow completion, Vault revokes credentials automatically
+
+```
+Temporal Workflow
+    ↓ activity: FetchCredential
+Temporal Activity
+    ↓ AppRole auth
+Vault / OpenBao
+    ↓ returns short-lived credential
+Activity uses credential, returns sanitized result
+    ↓ result (no secrets)
+Workflow records audit metadata
+```
+
+### codecserver: Vault Transit for Temporal Data
+
+The `zboralski/codecserver` project (Go) integrates HashiCorp Vault's Transit secrets engine with Temporal's codec server to encrypt/decrypt workflow data at rest. This is a **data converter** — it intercepts Temporal's serialization layer to encrypt payloads before they reach the event history database.
+
+This is complementary to our approach: we keep secrets out of event history by not passing them through workflows at all (only credential *paths* flow through Temporal). But codecserver demonstrates that the Temporal+Vault integration is well-established in Go.
+
+### What We Take
+
+The **JIT credential delivery** pattern validates our architectural decision:
+
+- Credential *paths* (safe) flow through the Temporal workflow
+- The actual vault fetch happens in goproxy after the workflow returns the decision
+- Secret values never appear in Temporal event history
+- OpenBao's AppRole auth scopes credentials to the proxy service identity
+- Short-lived leases with automatic revocation
+
+---
+
+## Pattern 4: Identity Integration (ai-iceberg-demo)
+
+### Architecture
+
+The `temporal-community/ai-iceberg-demo` project (4 stars, MIT, Python) integrates Auth0 with Temporal for a deep research agent. Auth0 protects the UI, tool calls, and agent access tokens across the stack.
+
+The separation of concerns:
+
+| Component | Role |
+|-----------|------|
+| Auth0 | Identity provider, JWT issuance, token lifecycle |
+| Temporal | Workflow orchestration, durable execution |
+| Neo4j | Session persistence, knowledge graph |
+| Redpanda | Event streaming, progress tracking |
+
+### What We Take
+
+The **identity-provider-as-separate-service** pattern matches our Keycloak integration:
+
+| ai-iceberg-demo | credential-proxy |
+|----------------|-----------------|
+| Auth0 | Keycloak |
+| JWT for UI + tool calls | JWT in `Proxy-Authorization` header |
+| Token lifecycle management | JWKS validation via `coreos/go-oidc` |
+| Scoped per-agent identity | `sub` + `realm_access.roles` claims |
+
+The key insight is that the identity provider issues JWTs independently of Temporal. The Temporal workflow receives pre-validated identity claims and uses them for authorization decisions — it does not perform authentication itself.
+
+---
+
+## Pattern 5: Temporal as Durable Backend (mcp-agent)
+
+### Architecture
+
+The `lastmile-ai/mcp-agent` project (8k stars, Apache-2.0, Python) uses Temporal as an optional durable execution backend for MCP-based agents. The framework's core insight: "Scales to production workloads using Temporal as the agent runtime backend without any API changes."
+
+The framework provides two execution modes:
+1. **In-process** — for development and testing
+2. **Temporal-backed** — for production durability
+
+This is achieved by abstracting the execution engine behind an interface. Agents define workflows using decorators and context managers. When Temporal is enabled, the same workflow code runs as Temporal workflows with activities.
+
+### What We Take
+
+The **dual execution mode** pattern is valuable for testing:
+
+- **Unit tests**: Run the access decision pipeline in-process (no Temporal server needed)
+- **Integration tests**: Run with `temporal-cli` dev server (real workflow execution)
+- **Production**: Run with full Temporal server (durability, search attributes, audit)
+
+This directly addresses review finding o29 (no workflow tests) — we can test the workflow logic without requiring a running Temporal server by using `go.temporal.io/sdk/testsuite`.
+
+---
+
+## Ecosystem Landscape
+
+### Temporal + AI Agent Projects (as of Feb 2026)
+
+| Project | Description | Lang | Stars |
+|---------|-------------|------|-------|
+| [temporal-ai-agent](https://github.com/temporal-community/temporal-ai-agent) | Multi-turn agent in Temporal workflow | Python | 628 |
+| [openai-agents-demos](https://github.com/temporal-community/openai-agents-demos) | OpenAI Agents SDK + Temporal | Python | 39 |
+| [durable-mcp](https://github.com/temporal-community/durable-mcp) | MCP tool calls as durable activities | Python | 13 |
+| [durable-react-agent-gemini](https://github.com/temporal-community/durable-react-agent-gemini) | Gemini agent with durable execution | Python | 0 |
+| [ai-iceberg-demo](https://github.com/temporal-community/ai-iceberg-demo) | Deep research agent (Auth0+Neo4j+Temporal) | Python | 4 |
+| [mcp-agent](https://github.com/lastmile-ai/mcp-agent) | MCP agent framework with Temporal backend | Python | 8000 |
+| [cognosisai/platform](https://github.com/cognosisai/platform) | LLM application template | Python | — |
+| [pydantic-ai-demos](https://github.com/temporal-community/pydantic-ai-demos) | Pydantic AI + Temporal | Python | 7 |
+| [temporal-spring-ai](https://github.com/temporal-community/temporal-spring-ai) | Spring AI + Temporal | Java | 4 |
+
+### Temporal + Security/Vault Projects
+
+| Project | Description | Lang |
+|---------|-------------|------|
+| [codecserver](https://github.com/zboralski/codecserver) | Vault Transit encryption for Temporal payloads | Go |
+| [temporal-encryption-converter](https://github.com/saga420/temporal-encryption-converter) | AES256/XChaCha20 encryption for workflows | Go |
+| [temporal-for-terraform](https://github.com/temporal-community/temporal-for-terraform) | Durable Terraform orchestration | Go |
+
+### Notable Gaps
+
+No existing project in the Temporal ecosystem implements:
+
+- A **forward proxy** using Temporal for access decisions
+- **MITM TLS** with Temporal-orchestrated credential injection
+- **Response sanitization** coordinated through workflows
+- **VSOCK transport** with Temporal orchestration
+- **OPA policy evaluation** as a Temporal activity
+
+Our credential proxy is novel in this space — it combines the agent orchestration patterns (temporal-ai-agent) with the JIT credential delivery pattern (Vault+Temporal) in a forward proxy context that no existing project addresses.
+
+---
+
+## Applied Architecture: ProxyAccessDecision Workflow
+
+Based on these patterns, our credential proxy should implement the access decision as a Temporal workflow:
+
+```go
+// ProxyAccessDecision orchestrates the authn → authz → credential resolution pipeline.
+// goproxy starts this workflow synchronously and waits for the result.
+// Secret values NEVER flow through this workflow — only credential paths.
+@workflow.defn
+func ProxyAccessDecision(ctx workflow.Context, input AccessDecisionInput) (AccessDecisionResult, error) {
+    // Activity 1: Validate JWT identity
+    var identity IdentityClaims
+    err := workflow.ExecuteActivity(ctx, ValidateIdentity, input.RawJWT).Get(ctx, &identity)
+    if err != nil {
+        return AccessDecisionResult{Status: "denied", Reason: "authentication_failed"}, nil
+    }
+
+    // Activity 2: Evaluate OPA authorization policy
+    authzInput := AuthzInput{
+        Identity:     identity,
+        Placeholders: input.PlaceholderHashes,
+        TargetDomain: input.TargetDomain,
+    }
+    var decision AuthzDecision
+    err = workflow.ExecuteActivity(ctx, EvaluatePolicy, authzInput).Get(ctx, &decision)
+    if err != nil || !decision.Allowed {
+        return AccessDecisionResult{Status: "denied", Reason: decision.Reason}, nil
+    }
+
+    // Activity 3: Resolve credential paths from vault metadata
+    // Returns PATHS only — not secret values
+    var paths []CredentialPath
+    err = workflow.ExecuteActivity(ctx, ResolveCredentialPaths, input.PlaceholderHashes).Get(ctx, &paths)
+    if err != nil {
+        return AccessDecisionResult{Status: "error", Reason: "vault_lookup_failed"}, nil
+    }
+
+    // Return decision to goproxy — goproxy fetches actual secrets and forwards
+    return AccessDecisionResult{
+        Status:          "allowed",
+        CredentialPaths: paths,
+        Identity:        identity,
+    }, nil
+}
+```
+
+### Workflow-goproxy Integration
+
+```go
+// In goproxy OnRequest handler:
+func (g *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+    // Start ProxyAccessDecision workflow (synchronous — blocks until complete)
+    workflowOptions := client.StartWorkflowOptions{
+        ID:        fmt.Sprintf("proxy-access-%s", requestID),
+        TaskQueue: "credential-proxy",
+        SearchAttributes: map[string]interface{}{
+            "AgentID":      agentID,
+            "TargetDomain": req.URL.Hostname(),
+        },
+    }
+
+    run, err := g.temporalClient.ExecuteWorkflow(ctx, workflowOptions, ProxyAccessDecision, input)
+    if err != nil {
+        return req, errorResponse(req, http.StatusBadGateway, "workflow_start_failed")
+    }
+
+    var result AccessDecisionResult
+    err = run.Get(ctx, &result)
+    if err != nil || result.Status != "allowed" {
+        return req, errorResponse(req, http.StatusForbidden, result.Reason)
+    }
+
+    // NOW fetch actual secrets from vault (outside workflow — secrets stay in memory)
+    credentials, err := g.vault.FetchCredentials(ctx, result.CredentialPaths)
+    if err != nil {
+        return req, errorResponse(req, http.StatusBadGateway, "vault_fetch_failed")
+    }
+
+    // Apply credentials to request
+    modifiedReq := placeholder.Replace(req, credentials)
+
+    // Store for response scrubbing
+    ctx.UserData = &ProxyResult{Credentials: credentials}
+    return modifiedReq, nil
+}
+```
+
+### What This Gives Us Over Inline Handlers
+
+| Concern | Inline (current) | Workflow-orchestrated |
+|---------|------------------|----------------------|
+| Audit of denied requests | Not recorded | Full workflow history |
+| Retry on OPA timeout | Handler fails | Activity retry policy |
+| Replay access decisions | Not possible | `tctl workflow show` |
+| Rate limiting | Custom code | Workflow-level throttling |
+| Circuit breaking | Custom code | Activity heartbeat + timeout |
+| Search/query | Fire-and-forget | Native search attributes |
+| Testing | Mock everything | `testsuite.TestWorkflowEnvironment` |
+
+---
+
+## Conclusions
+
+1. **The ecosystem validates our architecture.** Every Temporal agent project wraps access decisions and tool calls as activities inside a workflow. Our proxy access decision pipeline follows the same canonical pattern.
+
+2. **No existing project does what we're building.** The combination of VSOCK + MITM TLS + Temporal-orchestrated access decisions + response sanitization is novel. We're applying agent orchestration patterns to a security infrastructure problem.
+
+3. **Go is underrepresented.** Nearly all Temporal agent projects are Python. The Go ecosystem has the SDK but few reference implementations for agent patterns. Our project would be one of the first Go-based Temporal agent orchestration examples.
+
+4. **The JIT credential pattern is well-established.** Vault+Temporal integration for short-lived, scoped credentials is documented and implemented (codecserver). Our approach of keeping secrets out of event history by only passing credential paths through workflows aligns with ecosystem best practices.
+
+5. **Signal-driven HITL gates are a future extension.** The `confirm` signal pattern from temporal-ai-agent could be adapted for high-sensitivity credential access requiring human approval — a natural extension of our OPA policy layer.

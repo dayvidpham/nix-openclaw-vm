@@ -95,6 +95,7 @@ The credential-proxy design draws on patterns from established OSS projects. Det
 | [OpenBao](https://openbao.org/) | KV v2 secret engine, ACL policy model, AppRole auth, audit devices | [`openbao.Rmd`](docs/research/openbao.Rmd) |
 | [Temporal](https://temporal.io/) | Workflow vs activity distinction, search attributes, sealed activities for secret safety | [`temporal.Rmd`](docs/research/temporal.Rmd) |
 | [Temporal Go SDK](https://go.temporal.io/sdk) | `workflow.Context`, typed search attributes, `testsuite` patterns, non-retryable errors | [`temporal-go-sdk.Rmd`](docs/research/temporal-go-sdk.Rmd) |
+| [Temporal Agent Ecosystem](https://github.com/temporalio/awesome-temporal) | Workflow-as-orchestrator for access decisions, JIT credential delivery via Vault activities, signal-driven HITL gates | [`temporal-agent-orchestration.Rmd`](docs/research/temporal-agent-orchestration.Rmd) |
 
 ## Review Criteria
 
