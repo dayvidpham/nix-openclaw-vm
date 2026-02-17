@@ -78,6 +78,31 @@ leaf-task-a
 
 **Rule of thumb:** The `--blocked-by` target is always the thing you do *first*. Work flows bottom-up; closure flows top-down.
 
+## Review Criteria
+
+All implementation plans, slices, and code changes must be reviewed against these three axes:
+
+### 1. Correctness (spirit and technicality)
+
+- Does the implementation faithfully serve the user's original request (REQUEST) and the requirements captured in the URD?
+- Are the technical decisions consistent with the rationale in the PROPOSAL?
+- Are there gaps where the proposal says one thing but the code does another?
+- Are there requirements from the URD that are silently dropped or contradicted?
+
+### 2. Test quality
+
+- **Favour integration and end-to-end tests** over brittle unit tests that break on every refactor. Unit tests are appropriate for pure logic; anything involving I/O, state, or multi-component interaction should be integration-tested.
+- **The system under test must NOT be mocked out.** If the test mocks the very thing it claims to test, nothing is actually tested. Mock *dependencies*, not the subject.
+- **Use fixtures for common test values.** Repeatedly defining the same config, identity, placeholder, or credential inline across tests is brittle — a single schema change forces N updates. Define shared fixtures once and reference them.
+- **Test real behaviour, not implementation details.** Tests should assert on observable outcomes (HTTP status codes, response bodies, side effects) not on internal method calls or struct field values.
+
+### 3. Elegance and complexity matching
+
+- **Design the API you know you will need**, even if further complexity is deferred. Public interfaces should be complete for the known use cases — don't force callers to work around missing methods that are obviously needed.
+- **Do not over-engineer.** If the problem has 3 moving parts, the solution should have ~3 moving parts. Premature abstractions, plugin systems, and configurability for hypothetical futures add cost without value.
+- **Do not under-engineer.** If the problem is inherently complex (e.g., MITM TLS + credential injection + response scrubbing + audit), the solution should match that complexity. Cutting corners on security or correctness to reduce code is not simplicity.
+- **Complexity should be proportional to the innate complexity of the problem domain**, not to the amount of code written. Three similar lines are better than a premature abstraction. But a genuine 5-component pipeline deserves 5 clear components.
+
 ## Landing the Plane (Session Completion)
 
 **When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
