@@ -78,6 +78,24 @@ leaf-task-a
 
 **Rule of thumb:** The `--blocked-by` target is always the thing you do *first*. Work flows bottom-up; closure flows top-down.
 
+## Design References
+
+The credential-proxy design draws on patterns from established OSS projects. Detailed research reports live in `docs/research/`.
+
+| Project | What We Took | Report |
+|---------|-------------|--------|
+| [elazarl/goproxy](https://github.com/elazarl/goproxy) | HTTP proxy foundation — MITM CONNECT, handler registration, `UserData` propagation, `CertStorage` interface | [`goproxy.Rmd`](docs/research/goproxy.Rmd) |
+| [CyberArk Secretless Broker](https://github.com/cyberark/secretless-broker) | Provider factory pattern, credential zeroization, fail-through error collection | [`secretless-broker.Rmd`](docs/research/secretless-broker.Rmd) |
+| [Octelium](https://github.com/octelium/octelium) | `SecretManager` caching with watch-based invalidation, typed auth scheme union | [`octelium.Rmd`](docs/research/octelium.Rmd) |
+| [Ory Oathkeeper](https://www.ory.com/docs/oathkeeper) | Pipeline architecture (authn→authz→mutate), session state threading | [`oathkeeper.Rmd`](docs/research/oathkeeper.Rmd) |
+| [Vultrino](https://github.com/zachyking/vultrino) | Human-readable alias system, two-phase config validation | [`vultrino.Rmd`](docs/research/vultrino.Rmd) |
+| [Agent Gateway](https://github.com/agentgateway/agentgateway) | CEL-based authorization, per-route inline policies | [`agent-gateway.Rmd`](docs/research/agent-gateway.Rmd) |
+| [Peta Core](https://github.com/dunialabs/peta-core) | JIT decryption with TTL, short-lived agent tokens, batch audit logging | [`peta-core.Rmd`](docs/research/peta-core.Rmd) |
+| [Keycloak](https://www.keycloak.org/) | OIDC realm config, client credential grants, `realm_access.roles` claim structure | [`keycloak.Rmd`](docs/research/keycloak.Rmd) |
+| [OpenBao](https://openbao.org/) | KV v2 secret engine, ACL policy model, AppRole auth, audit devices | [`openbao.Rmd`](docs/research/openbao.Rmd) |
+| [Temporal](https://temporal.io/) | Workflow vs activity distinction, search attributes, sealed activities for secret safety | [`temporal.Rmd`](docs/research/temporal.Rmd) |
+| [Temporal Go SDK](https://go.temporal.io/sdk) | `workflow.Context`, typed search attributes, `testsuite` patterns, non-retryable errors | [`temporal-go-sdk.Rmd`](docs/research/temporal-go-sdk.Rmd) |
+
 ## Review Criteria
 
 All implementation plans, slices, and code changes must be reviewed against these three axes:
