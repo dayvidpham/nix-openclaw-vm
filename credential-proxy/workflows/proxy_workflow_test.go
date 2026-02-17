@@ -10,7 +10,6 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
 )
 
 // ---------------------------------------------------------------------------
@@ -307,6 +306,5 @@ func TestProxyRequestWorkflow_SearchAttributes(t *testing.T) {
 // as those called by the workflow (both reduce to "MethodName" in the registry).
 var _ = (*Activities)(nil) // compile-time nil pointer check
 
-// Ensure authz and authn types are available in this package's test scope.
+// Ensure authz types are available in this package's test scope.
 var _ authz.Evaluator = (*mockEvaluator)(nil)
-var _ authn.Verifier = (*mockVerifier)(nil)

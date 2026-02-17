@@ -91,6 +91,7 @@ func run(args []string) error {
 	// Create the shared RequestRegistry. It bridges the goproxy handler goroutines
 	// and the Temporal local activity worker goroutines in the same process.
 	registry := &proxy.RequestRegistry{}
+	registry.Start(ctx, cfg.RegistryTTL(), 30*time.Second)
 
 	// Initialize the proxy gateway. It holds a reference to the registry so that
 	// handleRequest can store RequestContext entries for FetchAndInject to look up.
@@ -111,7 +112,6 @@ func run(args []string) error {
 		Store:     vaultClient,
 		Config:    cfg,
 		Evaluator: evaluator,
-		Verifier:  verifier,
 		Registry:  registry,
 	}
 	w.RegisterActivity(activities)

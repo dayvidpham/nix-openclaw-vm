@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/elazarl/goproxy"
 	temporalclient "go.temporal.io/sdk/client"
 
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
@@ -718,5 +719,27 @@ func TestGateway_InvalidToken(t *testing.T) {
 	if resp.StatusCode != http.StatusProxyAuthRequired {
 		body, _ := io.ReadAll(resp.Body)
 		t.Errorf("status = %d, want %d (407); body = %q", resp.StatusCode, http.StatusProxyAuthRequired, body)
+	}
+}
+
+// TestGateway_NilResponsePassthrough verifies that handleResponse returns nil
+// without panicking when the upstream response itself is nil (e.g. connection
+// error to the upstream). goproxy passes nil resp on network-level failures.
+func TestGateway_NilResponsePassthrough(t *testing.T) {
+	certPath, keyPath := generateTestCA(t)
+	cfg := testConfig(t, certPath, keyPath)
+
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
+	gw, err := NewGateway(cfg, worker, reg, defaultMockVerifier())
+	if err != nil {
+		t.Fatalf("NewGateway: %v", err)
+	}
+
+	// handleResponse with nil resp and a ProxyCtx whose Req is nil.
+	// This exercises the early-exit guard before the nil body is dereferenced.
+	ctx := &goproxy.ProxyCtx{}
+	result := gw.handleResponse(nil, ctx)
+	if result != nil {
+		t.Errorf("handleResponse(nil, ...) = %v, want nil", result)
 	}
 }

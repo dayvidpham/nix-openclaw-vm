@@ -6,7 +6,6 @@ import (
 	"net/http"
 
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
 )
@@ -153,43 +152,20 @@ type Activities struct {
 	Store     vault.SecretStore
 	Config    *config.Config
 	Evaluator authz.Evaluator
-	Verifier  authn.Verifier
 	Registry  ContextRegistry
 }
 
 // ---------------------------------------------------------------------------
-// ValidateIdentity — regular activity (JWKS fetch needs network + retry)
+// IdentityClaims — JWT identity passed in ProxyInput (pre-validated by Gateway)
 // ---------------------------------------------------------------------------
 
-// ValidateIdentityInput is the serializable input for ValidateIdentity.
-// Only the raw JWT is passed; no secrets appear in Temporal event history.
-type ValidateIdentityInput struct {
-	RawJWT string `json:"raw_jwt"`
-}
-
-// IdentityClaims is the output of ValidateIdentity. It contains only public
-// metadata extracted from the JWT — safe to appear in Temporal event history.
+// IdentityClaims contains public metadata extracted from the JWT by the Gateway
+// during OnRequest. It is safe to appear in Temporal event history.
 type IdentityClaims struct {
 	Subject   string                 `json:"subject"`
 	Roles     []string               `json:"roles"`
 	Groups    []string               `json:"groups"`
 	RawClaims map[string]interface{} `json:"raw_claims"`
-}
-
-// ValidateIdentity verifies the raw JWT against the Keycloak JWKS endpoint and
-// extracts agent identity claims. It is a regular (non-local) Temporal activity
-// so that JWKS network calls benefit from Temporal's retry policy.
-func (a *Activities) ValidateIdentity(ctx context.Context, input ValidateIdentityInput) (*IdentityClaims, error) {
-	identity, err := a.Verifier.VerifyToken(ctx, input.RawJWT)
-	if err != nil {
-		return nil, fmt.Errorf("token verification failed: %w", err)
-	}
-	return &IdentityClaims{
-		Subject:   identity.Subject,
-		Roles:     identity.Roles,
-		Groups:    identity.Groups,
-		RawClaims: identity.RawClaims,
-	}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -277,8 +253,9 @@ func deny(ch chan *WorkflowDecision, reason DenialReason) {
 // Secrets exist only in this activity's local memory. They never appear in
 // Temporal event history, activity inputs, or activity outputs.
 //
-// IMPORTANT: This activity MUST send on DecisionCh before returning, even on
-// error. Otherwise the OnRequest goproxy goroutine will block until timeout.
+// IMPORTANT: This activity MUST send on DecisionCh before returning if the
+// registry entry exists. Otherwise the OnRequest goproxy goroutine will block
+// until timeout. If the registry entry is absent, goproxy already timed out.
 func (a *Activities) FetchAndInject(ctx context.Context, input FetchInjectInput) (*InjectResult, error) {
 	reqCtx, ok := a.Registry.Load(input.RequestID)
 	if !ok {

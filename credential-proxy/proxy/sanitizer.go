@@ -17,30 +17,36 @@ import (
 //
 // The response body is fully read, scrubbed, and replaced with a new reader.
 // Content-Length is updated to reflect the scrubbed body size.
-func ScrubCredentials(resp *http.Response, credentials map[string]string) error {
+//
+// The returned int is the total number of actual replacements made across all
+// credential values (not the number of map entries).
+func ScrubCredentials(resp *http.Response, credentials map[string]string) (int, error) {
 	if len(credentials) == 0 {
-		return nil
+		return 0, nil
 	}
-
-	// Build a strings.NewReplacer for efficient multi-pattern replacement.
-	pairs := make([]string, 0, len(credentials)*2)
-	for realVal, placeholder := range credentials {
-		pairs = append(pairs, realVal, placeholder)
-	}
-	r := strings.NewReplacer(pairs...)
 
 	// Read up to MaxBodyBytes from the response body.
 	if resp.Body == nil {
-		return nil
+		return 0, nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxBodyBytes))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	resp.Body.Close()
 
-	// Replace real credential values with placeholders.
-	scrubbed := r.Replace(string(body))
+	// Count actual occurrences and replace. strings.NewReplacer does not expose
+	// a replacement count, so we use strings.Count + strings.ReplaceAll instead.
+	scrubbed := string(body)
+	count := 0
+	for realVal, placeholder := range credentials {
+		n := strings.Count(scrubbed, realVal)
+		count += n
+		if n > 0 {
+			scrubbed = strings.ReplaceAll(scrubbed, realVal, placeholder)
+		}
+	}
+
 	scrubbedBytes := []byte(scrubbed)
 
 	// Reset body and update Content-Length.
@@ -48,5 +54,5 @@ func ScrubCredentials(resp *http.Response, credentials map[string]string) error 
 	resp.ContentLength = int64(len(scrubbedBytes))
 	resp.Header.Set("Content-Length", strconv.Itoa(len(scrubbedBytes)))
 
-	return nil
+	return count, nil
 }

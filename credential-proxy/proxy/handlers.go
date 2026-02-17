@@ -204,10 +204,11 @@ func (gw *Gateway) handleResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *h
 	// Scrub real credential values from the response body.
 	scrubCount := 0
 	if len(state.scrubMap) > 0 {
-		if err := ScrubCredentials(resp, state.scrubMap); err != nil {
+		n, err := ScrubCredentials(resp, state.scrubMap)
+		if err != nil {
 			slog.Error("credential scrubbing failed", "error", err)
 		} else {
-			scrubCount = len(state.scrubMap)
+			scrubCount = n
 		}
 	}
 

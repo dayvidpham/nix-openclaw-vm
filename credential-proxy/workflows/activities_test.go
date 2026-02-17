@@ -10,7 +10,6 @@ import (
 	"go.temporal.io/sdk/testsuite"
 
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/internal/testutil"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
@@ -34,21 +33,6 @@ func (m *mockEvaluator) Evaluate(_ context.Context, _ *authz.AuthzRequest) (*aut
 		return nil, m.err
 	}
 	return m.result, nil
-}
-
-// mockVerifier implements authn.Verifier for testing.
-type mockVerifier struct {
-	identity *authn.AgentIdentity
-	err      error
-}
-
-var _ authn.Verifier = (*mockVerifier)(nil)
-
-func (m *mockVerifier) VerifyToken(_ context.Context, _ string) (*authn.AgentIdentity, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	return m.identity, nil
 }
 
 // mockRegistry implements ContextRegistry for testing.
@@ -111,61 +95,6 @@ func defaultStore() *testutil.MockStore {
 				HeaderName: "x-api-key",
 			},
 		},
-	}
-}
-
-// ---------------------------------------------------------------------------
-// ValidateIdentity tests
-// ---------------------------------------------------------------------------
-
-func TestValidateIdentity_Success(t *testing.T) {
-	acts := &Activities{
-		Verifier: &mockVerifier{
-			identity: &authn.AgentIdentity{
-				Subject:   "agent-001",
-				Roles:     []string{"proxy-user"},
-				RawClaims: map[string]interface{}{"sub": "agent-001"},
-			},
-		},
-	}
-
-	ts := &testsuite.WorkflowTestSuite{}
-	env := ts.NewTestActivityEnvironment()
-	env.RegisterActivity(acts.ValidateIdentity)
-
-	result, err := env.ExecuteActivity(acts.ValidateIdentity, ValidateIdentityInput{RawJWT: "test.jwt.token"})
-	if err != nil {
-		t.Fatalf("ValidateIdentity error: %v", err)
-	}
-
-	var claims IdentityClaims
-	if err := result.Get(&claims); err != nil {
-		t.Fatalf("decode claims: %v", err)
-	}
-
-	if claims.Subject != "agent-001" {
-		t.Errorf("subject = %q, want %q", claims.Subject, "agent-001")
-	}
-	if len(claims.Roles) != 1 || claims.Roles[0] != "proxy-user" {
-		t.Errorf("roles = %v, want [proxy-user]", claims.Roles)
-	}
-}
-
-func TestValidateIdentity_InvalidToken(t *testing.T) {
-	acts := &Activities{
-		Verifier: &mockVerifier{err: fmt.Errorf("token signature invalid")},
-	}
-
-	ts := &testsuite.WorkflowTestSuite{}
-	env := ts.NewTestActivityEnvironment()
-	env.RegisterActivity(acts.ValidateIdentity)
-
-	_, err := env.ExecuteActivity(acts.ValidateIdentity, ValidateIdentityInput{RawJWT: "bad.token"})
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), "token signature invalid") {
-		t.Errorf("error = %v, want to contain 'token signature invalid'", err)
 	}
 }
 
@@ -476,5 +405,83 @@ func TestSendDecision_RegistryMiss(t *testing.T) {
 	})
 	if err != nil {
 		t.Errorf("SendDecision with missing registry entry should return nil, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FetchAndInject — unknown placeholder branch (cred == nil)
+// ---------------------------------------------------------------------------
+
+// testConfigNoCredentials returns a parsed config with no credential entries.
+// Used to exercise the "unknown credential placeholder" denial path in FetchAndInject.
+func testConfigNoCredentials(t *testing.T) *config.Config {
+	t.Helper()
+	yaml := `
+oidc:
+  issuer_url: "http://localhost:8080/realms/test"
+  audience: "test"
+vault:
+  address: "http://localhost:8200"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse empty-credentials config: %v", err)
+	}
+	return cfg
+}
+
+// TestFetchAndInject_UnknownPlaceholder verifies that when a placeholder is not
+// registered in the config, FetchAndInject:
+//   - returns an error containing "unknown credential placeholder"
+//   - sends a denied decision (ReasonCredentialInjectionFailed) on DecisionCh
+//     so that the goproxy handler goroutine is not left blocked.
+func TestFetchAndInject_UnknownPlaceholder(t *testing.T) {
+	cfg := testConfigNoCredentials(t)
+
+	req, _ := http.NewRequest("GET", "https://api.example.com/", nil)
+	decisionCh := make(chan *WorkflowDecision, 1)
+	reqCtx := &RequestContext{
+		Request:     req,
+		ScrubMap:    make(map[string]string),
+		DecisionCh:  decisionCh,
+		ReplaceFunc: func(_ map[string]string) error { return nil },
+	}
+
+	unknownPlaceholder := "agent-vault-zzzzzzzz-0000-0000-0000-000000000000"
+	reg := &mockRegistry{entries: map[string]*RequestContext{"req-unknown-ph": reqCtx}}
+	acts := &Activities{
+		Config:   cfg,
+		Registry: reg,
+	}
+
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.FetchAndInject)
+
+	_, err := env.ExecuteActivity(acts.FetchAndInject, FetchInjectInput{
+		RequestID:    "req-unknown-ph",
+		Placeholders: []string{unknownPlaceholder},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown placeholder, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown credential placeholder") {
+		t.Errorf("error = %v, want to contain 'unknown credential placeholder'", err)
+	}
+
+	// DecisionCh must have received a denied decision so goproxy is unblocked.
+	select {
+	case decision := <-decisionCh:
+		if decision.Status != DecisionDenied {
+			t.Errorf("decision.Status = %v, want %v", decision.Status, DecisionDenied)
+		}
+		if decision.Reason != ReasonCredentialInjectionFailed {
+			t.Errorf("decision.Reason = %v, want %v", decision.Reason, ReasonCredentialInjectionFailed)
+		}
+		if decision.HTTPStatus != ReasonCredentialInjectionFailed.HTTPStatusCode() {
+			t.Errorf("decision.HTTPStatus = %d, want %d", decision.HTTPStatus, ReasonCredentialInjectionFailed.HTTPStatusCode())
+		}
+	default:
+		t.Error("expected denied decision on DecisionCh after unknown placeholder, got none")
 	}
 }

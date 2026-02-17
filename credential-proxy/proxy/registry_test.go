@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,6 +155,48 @@ func TestRegistry_MultipleEntries(t *testing.T) {
 	}
 	if _, ok := reg.Load("fresh"); !ok {
 		t.Error("fresh entry should still be present")
+	}
+}
+
+// TestRegistry_ConcurrentAccess verifies that the registry is safe to use
+// concurrently: no panics, no data races. Run with -race to catch races.
+// After all goroutines finish, the registry must have no leftover entries
+// (every Store is followed by a Delete on the same goroutine).
+func TestRegistry_ConcurrentAccess(t *testing.T) {
+	reg := &RequestRegistry{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reg.Start(ctx, 200*time.Millisecond, 50*time.Millisecond)
+
+	var wg sync.WaitGroup
+	const workers = 10
+	const opsPerWorker = 100
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < opsPerWorker; i++ {
+				key := fmt.Sprintf("worker-%d-entry-%d", workerID, i)
+				reg.Store(key, makeTestReqCtx())
+				reg.Load(key)
+				reg.Delete(key)
+			}
+		}(w)
+	}
+
+	wg.Wait()
+
+	// Every entry was explicitly deleted, so the registry must now be empty.
+	// Verify by storing a sentinel and loading it — no stale keys interfere.
+	sentinel := "sentinel-after-concurrent"
+	reg.Store(sentinel, makeTestReqCtx())
+	if _, ok := reg.Load(sentinel); !ok {
+		t.Error("registry unusable after concurrent access: sentinel not found")
+	}
+	reg.Delete(sentinel)
+	if _, ok := reg.Load(sentinel); ok {
+		t.Error("sentinel should be absent after Delete")
 	}
 }
 
