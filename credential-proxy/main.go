@@ -71,14 +71,7 @@ func run(args []string) error {
 	}
 	slog.Info("vault client initialized", "address", cfg.Vault.Address)
 
-	// Initialize the proxy gateway.
-	gateway, err := proxy.NewGateway(cfg, verifier, evaluator, vaultClient)
-	if err != nil {
-		return fmt.Errorf("init gateway: %w", err)
-	}
-	slog.Info("proxy gateway initialized")
-
-	// Connect to Temporal and start worker.
+	// Connect to Temporal.
 	tc, err := temporalclient.Dial(temporalclient.Options{
 		HostPort:  cfg.Temporal.HostPort,
 		Namespace: cfg.Temporal.Namespace,
@@ -89,8 +82,17 @@ func run(args []string) error {
 	defer tc.Close()
 	slog.Info("Temporal client connected", "host_port", cfg.Temporal.HostPort, "namespace", cfg.Temporal.Namespace)
 
+	// Initialize the proxy gateway (needs Temporal client for audit workflows).
+	gateway, err := proxy.NewGateway(cfg, verifier, evaluator, vaultClient, tc)
+	if err != nil {
+		return fmt.Errorf("init gateway: %w", err)
+	}
+	slog.Info("proxy gateway initialized")
+
+	// Start Temporal worker.
 	w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(workflows.ProxyRequestWorkflow)
+	w.RegisterWorkflow(workflows.AuditWorkflow)
 	activities := &workflows.Activities{
 		Store: vaultClient,
 		HTTPClient: &http.Client{
@@ -101,6 +103,8 @@ func run(args []string) error {
 				return http.ErrUseLastResponse
 			},
 		},
+		Config:    cfg,
+		Evaluator: evaluator,
 	}
 	w.RegisterActivity(activities)
 
@@ -125,7 +129,9 @@ func run(args []string) error {
 	go func() {
 		<-ctx.Done()
 		slog.Info("shutting down")
-		if err := server.Shutdown(context.Background()); err != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer shutdownCancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
 			slog.Error("HTTP server shutdown error", "error", err)
 		}
 	}()

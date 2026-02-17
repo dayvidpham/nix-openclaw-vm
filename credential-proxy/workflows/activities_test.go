@@ -10,6 +10,8 @@ import (
 
 	"go.temporal.io/sdk/testsuite"
 
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
 )
 
@@ -30,6 +32,50 @@ func (m *mockSecretStore) FetchCredential(_ context.Context, vaultPath string) (
 		return nil, fmt.Errorf("%w: %s", vault.ErrSecretNotFound, vaultPath)
 	}
 	return cred, nil
+}
+
+// mockEvaluator implements authz.Evaluator for testing.
+type mockEvaluator struct {
+	result *authz.AuthzResult
+	err    error
+}
+
+var _ authz.Evaluator = (*mockEvaluator)(nil)
+
+func (m *mockEvaluator) Evaluate(_ context.Context, _ *authz.AuthzRequest) (*authz.AuthzResult, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.result, nil
+}
+
+// testConfig returns a parsed config with two credential entries for testing.
+func testConfig(t *testing.T) *config.Config {
+	t.Helper()
+	yaml := `
+oidc:
+  issuer_url: "http://localhost:8080/realms/test"
+  audience: "test"
+vault:
+  address: "http://localhost:8200"
+credentials:
+  - placeholder: "agent-vault-aaaaaaaa-1111-2222-3333-444444444444"
+    type: "bearer"
+    vault_path: "secret/data/cred-a"
+    bound_domain: "api.example.com"
+    header_name: "Authorization"
+    header_prefix: "Bearer "
+  - placeholder: "agent-vault-bbbbbbbb-1111-2222-3333-444444444444"
+    type: "api_key"
+    vault_path: "secret/data/cred-b"
+    bound_domain: "api.example.com"
+    header_name: "x-api-key"
+`
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse test config: %v", err)
+	}
+	return cfg
 }
 
 func TestFetchAndForward_Success(t *testing.T) {
@@ -127,7 +173,15 @@ func TestFetchAndForward_VaultError(t *testing.T) {
 }
 
 func TestValidateAndResolve_Success(t *testing.T) {
-	acts := &Activities{}
+	cfg := testConfig(t)
+	eval := &mockEvaluator{
+		result: &authz.AuthzResult{Allowed: true},
+	}
+
+	acts := &Activities{
+		Config:    cfg,
+		Evaluator: eval,
+	}
 
 	testSuite := &testsuite.WorkflowTestSuite{}
 	env := testSuite.NewTestActivityEnvironment()
@@ -135,8 +189,8 @@ func TestValidateAndResolve_Success(t *testing.T) {
 
 	result, err := env.ExecuteActivity(acts.ValidateAndResolve, ValidateAndResolveInput{
 		AgentID:           "agent-1",
-		TargetDomain:      "api.anthropic.com",
-		PlaceholderHashes: []string{"hash-aaa", "hash-bbb"},
+		TargetDomain:      "api.example.com",
+		PlaceholderHashes: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444", "agent-vault-bbbbbbbb-1111-2222-3333-444444444444"},
 	})
 	if err != nil {
 		t.Fatalf("ValidateAndResolve error: %v", err)
@@ -150,11 +204,11 @@ func TestValidateAndResolve_Success(t *testing.T) {
 	if len(output.CredentialPaths) != 2 {
 		t.Fatalf("expected 2 credential paths, got %d", len(output.CredentialPaths))
 	}
-	// Current stub maps hash→hash; verify both exist.
-	for _, hash := range []string{"hash-aaa", "hash-bbb"} {
-		if _, ok := output.CredentialPaths[hash]; !ok {
-			t.Errorf("expected credential path for %s", hash)
-		}
+	if output.CredentialPaths["agent-vault-aaaaaaaa-1111-2222-3333-444444444444"] != "secret/data/cred-a" {
+		t.Errorf("expected agent-vault-aaaaaaaa-1111-2222-3333-444444444444 → secret/data/cred-a, got %q", output.CredentialPaths["agent-vault-aaaaaaaa-1111-2222-3333-444444444444"])
+	}
+	if output.CredentialPaths["agent-vault-bbbbbbbb-1111-2222-3333-444444444444"] != "secret/data/cred-b" {
+		t.Errorf("expected agent-vault-bbbbbbbb-1111-2222-3333-444444444444 → secret/data/cred-b, got %q", output.CredentialPaths["agent-vault-bbbbbbbb-1111-2222-3333-444444444444"])
 	}
 }
 
@@ -181,5 +235,64 @@ func TestValidateAndResolve_EmptyInput(t *testing.T) {
 
 	if len(output.CredentialPaths) != 0 {
 		t.Errorf("expected 0 credential paths for empty input, got %d", len(output.CredentialPaths))
+	}
+}
+
+func TestValidateAndResolve_PolicyDenied(t *testing.T) {
+	cfg := testConfig(t)
+	eval := &mockEvaluator{
+		result: &authz.AuthzResult{Allowed: false, Reason: "agent not authorized for this domain"},
+	}
+
+	acts := &Activities{
+		Config:    cfg,
+		Evaluator: eval,
+	}
+
+	testSuite := &testsuite.WorkflowTestSuite{}
+	env := testSuite.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.ValidateAndResolve)
+
+	_, err := env.ExecuteActivity(acts.ValidateAndResolve, ValidateAndResolveInput{
+		AgentID:           "agent-1",
+		TargetDomain:      "api.example.com",
+		PlaceholderHashes: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444"},
+	})
+	if err == nil {
+		t.Fatal("expected error from policy denial, got nil")
+	}
+	if !strings.Contains(err.Error(), "access denied") {
+		t.Errorf("expected error to mention 'access denied', got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "agent not authorized") {
+		t.Errorf("expected error to mention deny reason, got: %v", err)
+	}
+}
+
+func TestValidateAndResolve_UnknownPlaceholder(t *testing.T) {
+	cfg := testConfig(t)
+	eval := &mockEvaluator{
+		result: &authz.AuthzResult{Allowed: true},
+	}
+
+	acts := &Activities{
+		Config:    cfg,
+		Evaluator: eval,
+	}
+
+	testSuite := &testsuite.WorkflowTestSuite{}
+	env := testSuite.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.ValidateAndResolve)
+
+	_, err := env.ExecuteActivity(acts.ValidateAndResolve, ValidateAndResolveInput{
+		AgentID:           "agent-1",
+		TargetDomain:      "api.example.com",
+		PlaceholderHashes: []string{"hash-nonexistent"},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown placeholder, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown placeholder") {
+		t.Errorf("expected error to mention 'unknown placeholder', got: %v", err)
 	}
 }

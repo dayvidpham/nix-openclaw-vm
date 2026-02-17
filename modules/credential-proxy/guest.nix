@@ -7,6 +7,7 @@
 # - HTTP_PROXY / HTTPS_PROXY point all agent traffic through the proxy
 # - The MITM CA cert is installed in the system trust store
 # - Placeholder env vars expose opaque tokens to the agent
+# - credproxy-auth / credproxy-request scripts are on PATH for agent use
 { config
 , pkgs
 , lib ? pkgs.lib
@@ -21,6 +22,20 @@ let
     mkEnableOption
     types
     ;
+
+  # Guest-side client scripts for credential proxy interaction.
+  # writeShellApplication provides bash shebang, set -euo pipefail,
+  # and injects runtimeInputs into PATH.
+  credproxy-auth = pkgs.writeShellApplication {
+    name = "credproxy-auth";
+    runtimeInputs = [ pkgs.curl pkgs.jq ];
+    text = builtins.readFile ../../credential-proxy/scripts/credproxy-auth.sh;
+  };
+  credproxy-request = pkgs.writeShellApplication {
+    name = "credproxy-request";
+    runtimeInputs = [ pkgs.curl ];
+    text = builtins.readFile ../../credential-proxy/scripts/credproxy-request.sh;
+  };
 in
 {
   options.CUSTOM.virtualisation.openclaw-vm.guest.credentialProxy = {
@@ -42,6 +57,24 @@ in
       type = types.nullOr types.path;
       default = null;
       description = "Path to the credential proxy MITM CA certificate for trust store installation";
+    };
+
+    keycloakURL = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "Keycloak token endpoint URL for OIDC authentication";
+    };
+
+    clientId = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "OIDC client ID for credential proxy authentication";
+    };
+
+    clientSecretFile = mkOption {
+      type = types.nullOr types.path;
+      default = null;
+      description = "Path to file containing the OIDC client secret (read at runtime by credproxy-auth)";
     };
 
     placeholderEnvVars = mkOption {
@@ -93,12 +126,38 @@ in
     # (assertion above guarantees caCertFile is non-null when enabled)
     security.pki.certificateFiles = [ cfg.caCertFile ];
 
-    # Set proxy environment variables system-wide so all agent processes
-    # route through the credential proxy.
-    environment.sessionVariables = {
+    # Client scripts for credential proxy interaction (auth + request wrapper)
+    environment.systemPackages = [
+      credproxy-auth
+      credproxy-request
+    ];
+
+    # Proxy env vars: use environment.variables so systemd services also get them
+    environment.variables = {
       HTTP_PROXY = "http://localhost:${toString cfg.localPort}";
       HTTPS_PROXY = "http://localhost:${toString cfg.localPort}";
       NO_PROXY = "localhost,127.0.0.1";
     } // cfg.placeholderEnvVars;
+
+    # CREDPROXY_TOKEN_FILE uses XDG_RUNTIME_DIR which must be evaluated at
+    # login time, not build time — set via a profile.d snippet.
+    environment.etc."profile.d/credproxy-token.sh" = {
+      text = ''
+        export CREDPROXY_TOKEN_FILE="''${XDG_RUNTIME_DIR:-/tmp}/credproxy-jwt"
+      '';
+    };
+
+    # Generate /etc/credproxy/client.env for credproxy-auth when Keycloak is configured
+    environment.etc."credproxy/client.env" = mkIf (cfg.keycloakURL != null) {
+      text = lib.concatStringsSep "\n" (
+        [ "CREDPROXY_KEYCLOAK_URL=${lib.escapeShellArg cfg.keycloakURL}" ]
+        ++ lib.optional (cfg.clientId != null)
+          "CREDPROXY_CLIENT_ID=${lib.escapeShellArg cfg.clientId}"
+        ++ lib.optional (cfg.clientSecretFile != null)
+          "CREDPROXY_CLIENT_SECRET_FILE=${lib.escapeShellArg (toString cfg.clientSecretFile)}"
+        ++ [ "" ]
+      );
+      mode = "0644";
+    };
   };
 }

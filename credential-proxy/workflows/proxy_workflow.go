@@ -96,6 +96,26 @@ func ProxyRequestWorkflow(ctx workflow.Context, input ProxyWorkflowInput) (*Prox
 	return finalize(ctx, start, StatusSuccess, forwardOutput.BytesTransferred, nil)
 }
 
+// AuditWorkflow is a lightweight fire-and-forget workflow that records
+// request metadata as Temporal search attributes for observability.
+// Unlike ProxyRequestWorkflow, it does NOT execute any activities —
+// no credential resolution, no upstream API calls.
+func AuditWorkflow(ctx workflow.Context, input ProxyWorkflowInput) (*ProxyWorkflowOutput, error) {
+	start := workflow.Now(ctx)
+
+	credRefHash := strings.Join(input.PlaceholderHashes, ",")
+	sa := audit.NewSearchAttributes(input.AgentID, input.TargetDomain, credRefHash, string(StatusSuccess))
+	if err := workflow.UpsertTypedSearchAttributes(ctx, sa.ToSearchAttributeUpdates()...); err != nil {
+		return nil, err
+	}
+
+	latencyMs := workflow.Now(ctx).Sub(start).Milliseconds()
+	return &ProxyWorkflowOutput{
+		Status:    StatusSuccess,
+		LatencyMs: latencyMs,
+	}, nil
+}
+
 // finalize upserts the terminal search attribute status and returns the output.
 func finalize(ctx workflow.Context, start time.Time, status ProxyStatus, bytesTransferred int64, workflowErr error) (*ProxyWorkflowOutput, error) {
 	latencyMs := workflow.Now(ctx).Sub(start).Milliseconds()

@@ -1,15 +1,19 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/elazarl/goproxy"
+	temporalclient "go.temporal.io/sdk/client"
 
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/workflows"
 )
 
 // requestState is stored in ctx.UserData to pass data from OnRequest to OnResponse.
@@ -42,14 +46,14 @@ func (gw *Gateway) handleConnect(host string, ctx *goproxy.ProxyCtx) (*goproxy.C
 
 	// Fail-closed: reject connections to non-allowlisted domains.
 	if !gw.cfg.IsAllowedDomain(domain) {
-		log.Printf("CONNECT rejected: domain %q not in allowlist", domain)
+		slog.Warn("CONNECT rejected", "reason", "domain not in allowlist", "domain", domain)
 		return goproxy.RejectConnect, host
 	}
 
 	// Extract JWT from Proxy-Authorization header.
 	rawToken := extractBearerToken(ctx.Req.Header.Get("Proxy-Authorization"))
 	if rawToken == "" {
-		log.Printf("CONNECT rejected: missing Proxy-Authorization bearer token")
+		slog.Warn("CONNECT rejected", "reason", "missing bearer token")
 		return goproxy.RejectConnect, host
 	}
 
@@ -77,14 +81,14 @@ func (gw *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*htt
 	// Verify JWT → agent identity.
 	identity, err := gw.auth.VerifyToken(bgCtx, rawToken)
 	if err != nil {
-		log.Printf("auth: token verification failed: %v", err)
+		slog.Warn("token verification failed", "error", err)
 		return req, errorResponse(req, http.StatusForbidden, "token verification failed")
 	}
 
 	// Extract placeholders from request.
 	placeholders, err := Extract(req)
 	if err != nil {
-		log.Printf("placeholder extraction failed: %v", err)
+		slog.Error("placeholder extraction failed", "error", err, "subject", identity.Subject)
 		return req, errorResponse(req, http.StatusBadRequest, "failed to read request body")
 	}
 
@@ -99,7 +103,7 @@ func (gw *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*htt
 	for _, ph := range placeholders {
 		cred := gw.cfg.LookupCredential(ph)
 		if cred == nil {
-			log.Printf("unknown placeholder: %s", ph)
+			slog.Warn("unknown placeholder", "placeholder", ph, "subject", identity.Subject, "domain", targetDomain)
 			return req, errorResponse(req, http.StatusForbidden,
 				fmt.Sprintf("unknown credential placeholder: %s", ph))
 		}
@@ -118,11 +122,12 @@ func (gw *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*htt
 		Credentials:  bindings,
 	})
 	if err != nil {
-		log.Printf("authz evaluation error: %v", err)
+		slog.Error("authz evaluation error", "error", err, "subject", identity.Subject, "domain", targetDomain)
 		return req, errorResponse(req, http.StatusInternalServerError, "authorization evaluation failed")
 	}
 	if !authzResult.Allowed {
-		log.Printf("authz denied: %s", authzResult.Reason)
+		slog.Warn("authz denied", "reason", authzResult.Reason, "subject", identity.Subject,
+			"domain", targetDomain, "placeholder_count", len(placeholders))
 		return req, errorResponse(req, http.StatusForbidden,
 			fmt.Sprintf("access denied: %s", authzResult.Reason))
 	}
@@ -134,7 +139,7 @@ func (gw *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*htt
 	for _, b := range bindings {
 		credVal, err := gw.vault.FetchCredential(bgCtx, b.VaultPath)
 		if err != nil {
-			log.Printf("vault fetch failed for %s: %v", b.VaultPath, err)
+			slog.Error("vault fetch failed", "error", err, "subject", identity.Subject, "domain", targetDomain)
 			return req, errorResponse(req, http.StatusBadGateway, "credential resolution failed")
 		}
 
@@ -151,12 +156,35 @@ func (gw *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*htt
 
 	// Replace placeholders with real credentials in the request.
 	if err := ReplaceInRequest(req, replacements); err != nil {
-		log.Printf("credential injection failed: %v", err)
+		slog.Error("credential injection failed", "error", err, "subject", identity.Subject, "domain", targetDomain)
 		return req, errorResponse(req, http.StatusInternalServerError, "credential injection failed")
 	}
 
 	// Store scrub map for the response handler.
 	ctx.UserData = &requestState{scrubMap: scrubMap}
+
+	// Fire async Temporal audit workflow (fire-and-forget).
+	// AuditWorkflow only records search attributes — no credential resolution or upstream calls.
+	go func() {
+		wfID := fmt.Sprintf("credproxy-%s-%d", identity.Subject, time.Now().UnixNano())
+		_, err := gw.temporal.ExecuteWorkflow(context.Background(), temporalclient.StartWorkflowOptions{
+			ID:        wfID,
+			TaskQueue: gw.cfg.Temporal.TaskQueue,
+		}, workflows.AuditWorkflow, workflows.ProxyWorkflowInput{
+			AgentID:           identity.Subject,
+			RequestID:         wfID,
+			TargetDomain:      targetDomain,
+			Method:            req.Method,
+			Path:              req.URL.Path,
+			PlaceholderHashes: placeholders,
+		})
+		if err != nil {
+			slog.Error("temporal audit workflow failed", "error", err, "workflow_id", wfID, "agent_id", identity.Subject)
+		}
+	}()
+
+	slog.Info("request processed", "subject", identity.Subject, "domain", targetDomain,
+		"method", req.Method, "path", req.URL.Path, "placeholder_count", len(placeholders))
 
 	return req, nil
 }
@@ -180,7 +208,7 @@ func (gw *Gateway) handleResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *h
 	}
 
 	if err := ScrubCredentials(resp, state.scrubMap); err != nil {
-		log.Printf("credential scrubbing failed: %v", err)
+		slog.Error("credential scrubbing failed", "error", err)
 	}
 
 	return resp

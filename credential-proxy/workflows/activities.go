@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
 )
 
@@ -13,6 +15,8 @@ import (
 type Activities struct {
 	Store      vault.SecretStore
 	HTTPClient *http.Client
+	Config     *config.Config
+	Evaluator  authz.Evaluator
 }
 
 // --- ValidateAndResolve ---
@@ -38,21 +42,40 @@ type ValidateAndResolveOutput struct {
 // placeholder hash to its corresponding vault path. This activity's input and
 // output are safe to appear in Temporal event history.
 func (a *Activities) ValidateAndResolve(ctx context.Context, input ValidateAndResolveInput) (*ValidateAndResolveOutput, error) {
-	// TODO: Wire in OPA Evaluator for policy check.
-	// For now, build the credential path mapping.
-
 	if len(input.PlaceholderHashes) == 0 {
 		return &ValidateAndResolveOutput{
 			CredentialPaths: map[string]string{},
 		}, nil
 	}
 
-	// Placeholder resolution will be wired to config lookup.
-	// For now, return the hashes as-is to keep the pipeline compiling.
+	// Resolve each placeholder hash to its vault path via config index.
 	paths := make(map[string]string, len(input.PlaceholderHashes))
+	bindings := make([]authz.CredentialBinding, 0, len(input.PlaceholderHashes))
 	for _, hash := range input.PlaceholderHashes {
-		// TODO: Resolve hash → config.Credential → VaultPath via config index.
-		paths[hash] = hash
+		cred := a.Config.LookupCredential(hash)
+		if cred == nil {
+			return nil, fmt.Errorf("unknown placeholder: %s", hash)
+		}
+		paths[hash] = cred.VaultPath
+		bindings = append(bindings, authz.CredentialBinding{
+			Placeholder: hash,
+			BoundDomain: cred.BoundDomain,
+			VaultPath:   cred.VaultPath,
+		})
+	}
+
+	// Evaluate OPA policy.
+	result, err := a.Evaluator.Evaluate(ctx, &authz.AuthzRequest{
+		Identity:     map[string]interface{}{"sub": input.AgentID},
+		Placeholders: input.PlaceholderHashes,
+		TargetDomain: input.TargetDomain,
+		Credentials:  bindings,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("policy evaluation: %w", err)
+	}
+	if !result.Allowed {
+		return nil, fmt.Errorf("access denied: %s", result.Reason)
 	}
 
 	return &ValidateAndResolveOutput{
@@ -98,7 +121,7 @@ func (a *Activities) FetchAndForward(ctx context.Context, input FetchAndForwardI
 	for placeholderHash, vaultPath := range input.CredentialPaths {
 		cred, err := a.Store.FetchCredential(ctx, vaultPath)
 		if err != nil {
-			slog.ErrorContext(ctx, "vault fetch failed", "vault_path", vaultPath, "error", err)
+			slog.ErrorContext(ctx, "vault fetch failed", "placeholder", placeholderHash, "error", err)
 			return nil, fmt.Errorf("fetch credential for placeholder %s: %w", placeholderHash, err)
 		}
 		secrets[placeholderHash] = cred
