@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -24,73 +25,123 @@ import (
 
 	temporalclient "go.temporal.io/sdk/client"
 
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/workflows"
 )
 
 // ---------------------------------------------------------------------------
-// Mock implementations
+// simulatedWorker — replaces the real Temporal worker for gateway integration tests.
+//
+// It implements temporalclient.Client by embedding the interface (nil for unused
+// methods) and overriding ExecuteWorkflow and SignalWorkflow. When ExecuteWorkflow
+// is called it runs the credential injection logic synchronously in a goroutine,
+// simulating the FetchAndInject local activity, so that the gateway handler
+// goroutine unblocks on DecisionCh as it would with a real worker.
 // ---------------------------------------------------------------------------
 
-type mockVerifier struct {
-	identity *authn.AgentIdentity
-	err      error
+type simulatedWorker struct {
+	temporalclient.Client // nil — only ExecuteWorkflow / SignalWorkflow are called
+	registry *RequestRegistry
+	cfg      *config.Config
+	store    vault.SecretStore
+	// decisionOverride, if non-nil, is sent as the decision for every request.
+	// Used to test denial paths without involving the vault / config.
+	decisionOverride *workflows.WorkflowDecision
 }
 
-func (m *mockVerifier) VerifyToken(_ context.Context, _ string) (*authn.AgentIdentity, error) {
-	if m.err != nil {
-		return nil, m.err
+var _ temporalclient.Client = (*simulatedWorker)(nil)
+
+func (sw *simulatedWorker) ExecuteWorkflow(
+	ctx context.Context,
+	opts temporalclient.StartWorkflowOptions,
+	_ interface{},
+	args ...interface{},
+) (temporalclient.WorkflowRun, error) {
+	run := &fakeWorkflowRun{id: opts.ID}
+
+	if len(args) == 0 {
+		return run, nil
 	}
-	return m.identity, nil
-}
-
-type mockEvaluator struct {
-	result *authz.AuthzResult
-	err    error
-}
-
-func (m *mockEvaluator) Evaluate(_ context.Context, _ *authz.AuthzRequest) (*authz.AuthzResult, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	return m.result, nil
-}
-
-type mockStore struct {
-	credentials map[string]*vault.CredentialValue
-	err         error
-}
-
-func (m *mockStore) FetchCredential(_ context.Context, vaultPath string) (*vault.CredentialValue, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	cred, ok := m.credentials[vaultPath]
+	input, ok := args[0].(workflows.ProxyInput)
 	if !ok {
-		return nil, vault.ErrSecretNotFound
+		return run, nil
 	}
-	return cred, nil
+
+	go func() {
+		reqCtx, ok := sw.registry.Load(input.RequestID)
+		if !ok {
+			return
+		}
+
+		// Honor override decision (for deny-path tests).
+		if sw.decisionOverride != nil {
+			reqCtx.DecisionCh <- sw.decisionOverride
+			return
+		}
+
+		// Simulate FetchAndInject: resolve credentials and inject them.
+		replacements := make(map[string]string, len(input.Placeholders))
+		for _, ph := range input.Placeholders {
+			cred := sw.cfg.LookupCredential(ph)
+			if cred == nil {
+				reqCtx.DecisionCh <- &workflows.WorkflowDecision{
+					Status:     workflows.DecisionDenied,
+					Reason:     workflows.ReasonCredentialInjectionFailed,
+					HTTPStatus: workflows.ReasonCredentialInjectionFailed.HTTPStatusCode(),
+				}
+				return
+			}
+			cv, err := sw.store.FetchCredential(ctx, cred.VaultPath)
+			if err != nil {
+				reqCtx.DecisionCh <- &workflows.WorkflowDecision{
+					Status:     workflows.DecisionDenied,
+					Reason:     workflows.ReasonCredentialInjectionFailed,
+					HTTPStatus: workflows.ReasonCredentialInjectionFailed.HTTPStatusCode(),
+				}
+				return
+			}
+			realValue := cv.HeaderPrefix + cv.Key
+			replacements[ph] = realValue
+			reqCtx.ScrubMap[realValue] = ph
+			if cv.HeaderPrefix != "" {
+				reqCtx.ScrubMap[cv.Key] = ph
+			}
+		}
+
+		if err := reqCtx.ReplaceFunc(replacements); err != nil {
+			reqCtx.DecisionCh <- &workflows.WorkflowDecision{
+				Status:     workflows.DecisionDenied,
+				Reason:     workflows.ReasonCredentialInjectionFailed,
+				HTTPStatus: workflows.ReasonCredentialInjectionFailed.HTTPStatusCode(),
+			}
+			return
+		}
+
+		reqCtx.DecisionCh <- &workflows.WorkflowDecision{Status: workflows.DecisionAllowed}
+	}()
+
+	return run, nil
 }
 
-// mockTemporalClient implements temporalclient.Client by embedding the
-// interface. Only ExecuteWorkflow is overridden (fire-and-forget in handlers).
-type mockTemporalClient struct {
-	temporalclient.Client
+func (sw *simulatedWorker) SignalWorkflow(_ context.Context, _, _, _ string, _ interface{}) error {
+	return nil // no-op in tests
 }
 
-func (m *mockTemporalClient) ExecuteWorkflow(_ context.Context, _ temporalclient.StartWorkflowOptions, _ interface{}, _ ...interface{}) (temporalclient.WorkflowRun, error) {
-	return nil, nil
+// fakeWorkflowRun is the minimal WorkflowRun returned by simulatedWorker.
+type fakeWorkflowRun struct {
+	id string
+}
+
+func (f *fakeWorkflowRun) GetID() string                                          { return f.id }
+func (f *fakeWorkflowRun) GetRunID() string                                       { return "test-run-id" }
+func (f *fakeWorkflowRun) Get(_ context.Context, _ interface{}) error             { return nil }
+func (f *fakeWorkflowRun) GetWithOptions(_ context.Context, _ interface{}, _ temporalclient.WorkflowRunGetOptions) error {
+	return nil
 }
 
 // Compile-time interface satisfaction checks.
-var (
-	_ authn.Verifier          = (*mockVerifier)(nil)
-	_ authz.Evaluator        = (*mockEvaluator)(nil)
-	_ vault.SecretStore      = (*mockStore)(nil)
-	_ temporalclient.Client  = (*mockTemporalClient)(nil)
-)
+var _ temporalclient.Client = (*simulatedWorker)(nil)
 
 // ---------------------------------------------------------------------------
 // Test constants
@@ -190,12 +241,56 @@ credentials:
 	return cfg
 }
 
-// startGateway creates a Gateway, starts serving on a random port, and returns
-// the listener address. The listener is closed via t.Cleanup.
-func startGateway(t *testing.T, cfg *config.Config, v authn.Verifier, e authz.Evaluator, s vault.SecretStore) string {
+func defaultMockStore() *mockStore {
+	return &mockStore{
+		credentials: map[string]*vault.CredentialValue{
+			gwVaultPath: {
+				Key:          gwRealSecret,
+				HeaderName:   "x-api-key",
+				HeaderPrefix: "",
+			},
+		},
+	}
+}
+
+// mockStore implements vault.SecretStore.
+type mockStore struct {
+	credentials map[string]*vault.CredentialValue
+	err         error
+}
+
+var _ vault.SecretStore = (*mockStore)(nil)
+
+func (m *mockStore) FetchCredential(_ context.Context, vaultPath string) (*vault.CredentialValue, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	cred, ok := m.credentials[vaultPath]
+	if !ok {
+		return nil, vault.ErrSecretNotFound
+	}
+	return cred, nil
+}
+
+// newSimulatedWorker builds a simulatedWorker with the shared registry, config,
+// and vault mock. Use decisionOverride to force a specific decision for deny tests.
+func newSimulatedWorker(cfg *config.Config, store vault.SecretStore, override *workflows.WorkflowDecision) (*simulatedWorker, *RequestRegistry) {
+	reg := &RequestRegistry{}
+	return &simulatedWorker{
+		registry:         reg,
+		cfg:              cfg,
+		store:            store,
+		decisionOverride: override,
+	}, reg
+}
+
+// startGateway creates a Gateway backed by the given simulatedWorker, starts
+// serving on a random port, and returns the listener address. The listener is
+// closed via t.Cleanup.
+func startGateway(t *testing.T, cfg *config.Config, worker *simulatedWorker, reg *RequestRegistry) string {
 	t.Helper()
 
-	gw, err := NewGateway(cfg, v, e, s, &mockTemporalClient{})
+	gw, err := NewGateway(cfg, worker, reg)
 	if err != nil {
 		t.Fatalf("NewGateway: %v", err)
 	}
@@ -210,7 +305,7 @@ func startGateway(t *testing.T, cfg *config.Config, v authn.Verifier, e authz.Ev
 	return ln.Addr().String()
 }
 
-// proxyClient returns an *http.Client configured to proxy through proxyAddr.
+// gwProxyClient returns an *http.Client configured to proxy through proxyAddr.
 func gwProxyClient(t *testing.T, proxyAddr string) *http.Client {
 	t.Helper()
 	proxyURL, err := url.Parse("http://" + proxyAddr)
@@ -220,33 +315,6 @@ func gwProxyClient(t *testing.T, proxyAddr string) *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
 		Timeout:   5 * time.Second,
-	}
-}
-
-func defaultMockVerifier() *mockVerifier {
-	return &mockVerifier{
-		identity: &authn.AgentIdentity{
-			Subject:   "agent-001",
-			RawClaims: map[string]interface{}{"sub": "agent-001"},
-		},
-	}
-}
-
-func defaultMockEvaluator() *mockEvaluator {
-	return &mockEvaluator{
-		result: &authz.AuthzResult{Allowed: true},
-	}
-}
-
-func defaultMockStore() *mockStore {
-	return &mockStore{
-		credentials: map[string]*vault.CredentialValue{
-			gwVaultPath: {
-				Key:          gwRealSecret,
-				HeaderName:   "x-api-key",
-				HeaderPrefix: "",
-			},
-		},
 	}
 }
 
@@ -268,7 +336,8 @@ func TestGateway_PlaceholderSubstitution(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	addr := startGateway(t, cfg, defaultMockVerifier(), defaultMockEvaluator(), defaultMockStore())
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
+	addr := startGateway(t, cfg, worker, reg)
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", upstream.URL+"/v1/chat", nil)
@@ -302,7 +371,8 @@ func TestGateway_DomainReject(t *testing.T) {
 	certPath, keyPath := generateTestCA(t)
 	cfg := testConfig(t, certPath, keyPath)
 
-	addr := startGateway(t, cfg, defaultMockVerifier(), defaultMockEvaluator(), defaultMockStore())
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
+	addr := startGateway(t, cfg, worker, reg)
 
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -336,7 +406,8 @@ func TestGateway_AuthReject(t *testing.T) {
 	certPath, keyPath := generateTestCA(t)
 	cfg := testConfig(t, certPath, keyPath)
 
-	addr := startGateway(t, cfg, defaultMockVerifier(), defaultMockEvaluator(), defaultMockStore())
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
+	addr := startGateway(t, cfg, worker, reg)
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", "http://127.0.0.1/api", nil)
@@ -344,6 +415,7 @@ func TestGateway_AuthReject(t *testing.T) {
 		t.Fatalf("create request: %v", err)
 	}
 	// Intentionally no Proxy-Authorization.
+	req.Header.Set("X-Api-Key", gwPlaceholder)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -357,20 +429,21 @@ func TestGateway_AuthReject(t *testing.T) {
 	}
 }
 
-// TestGateway_AuthzDeny verifies that when the authorization evaluator denies
-// a request, the gateway returns 403 with the denial reason.
-func TestGateway_AuthzDeny(t *testing.T) {
+// TestGateway_WorkflowDeny verifies that when the Temporal workflow denies a
+// request (e.g. authz failure), the gateway returns 403 with the denial reason.
+func TestGateway_WorkflowDeny(t *testing.T) {
 	certPath, keyPath := generateTestCA(t)
 	cfg := testConfig(t, certPath, keyPath)
 
-	denyEval := &mockEvaluator{
-		result: &authz.AuthzResult{
-			Allowed: false,
-			Reason:  "insufficient permissions",
-		},
+	// Override: workflow always denies due to authorization failure.
+	denyDecision := &workflows.WorkflowDecision{
+		Status:     workflows.DecisionDenied,
+		Reason:     workflows.ReasonAuthorizationDenied,
+		HTTPStatus: workflows.ReasonAuthorizationDenied.HTTPStatusCode(),
 	}
 
-	addr := startGateway(t, cfg, defaultMockVerifier(), denyEval, defaultMockStore())
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), denyDecision)
+	addr := startGateway(t, cfg, worker, reg)
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", "http://127.0.0.1/api", nil)
@@ -391,8 +464,8 @@ func TestGateway_AuthzDeny(t *testing.T) {
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "insufficient permissions") {
-		t.Errorf("body = %q, want to contain 'insufficient permissions'", body)
+	if !strings.Contains(string(body), workflows.ReasonAuthorizationDenied.String()) {
+		t.Errorf("body = %q, want to contain %q", body, workflows.ReasonAuthorizationDenied.String())
 	}
 }
 
@@ -411,7 +484,8 @@ func TestGateway_ResponseScrubbing(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	addr := startGateway(t, cfg, defaultMockVerifier(), defaultMockEvaluator(), defaultMockStore())
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
+	addr := startGateway(t, cfg, worker, reg)
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", upstream.URL+"/api", nil)
@@ -446,7 +520,7 @@ func TestGateway_ResponseScrubbing(t *testing.T) {
 }
 
 // TestGateway_NoPlaceholderPassthrough verifies that requests without any
-// placeholders pass through the gateway unmodified.
+// placeholders pass through the gateway unmodified (no Temporal workflow started).
 func TestGateway_NoPlaceholderPassthrough(t *testing.T) {
 	certPath, keyPath := generateTestCA(t)
 	cfg := testConfig(t, certPath, keyPath)
@@ -456,7 +530,8 @@ func TestGateway_NoPlaceholderPassthrough(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	addr := startGateway(t, cfg, defaultMockVerifier(), defaultMockEvaluator(), defaultMockStore())
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
+	addr := startGateway(t, cfg, worker, reg)
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", upstream.URL+"/health", nil)
@@ -464,6 +539,7 @@ func TestGateway_NoPlaceholderPassthrough(t *testing.T) {
 		t.Fatalf("create request: %v", err)
 	}
 	req.Header.Set("Proxy-Authorization", "Bearer "+gwTestToken)
+	// No placeholder headers.
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -491,10 +567,11 @@ func TestGateway_UnknownPlaceholder(t *testing.T) {
 	certPath, keyPath := generateTestCA(t)
 	cfg := testConfig(t, certPath, keyPath)
 
-	addr := startGateway(t, cfg, defaultMockVerifier(), defaultMockEvaluator(), defaultMockStore())
-	client := gwProxyClient(t, addr)
-
 	unknownPH := "agent-vault-99999999-0000-1111-2222-333333333333"
+
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
+	addr := startGateway(t, cfg, worker, reg)
+	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", "http://127.0.0.1/api", nil)
 	if err != nil {
@@ -509,12 +586,91 @@ func TestGateway_UnknownPlaceholder(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusForbidden {
-		t.Errorf("status = %d, want %d (403)", resp.StatusCode, http.StatusForbidden)
+	if resp.StatusCode != workflows.ReasonCredentialInjectionFailed.HTTPStatusCode() {
+		t.Errorf("status = %d, want %d (502)", resp.StatusCode, workflows.ReasonCredentialInjectionFailed.HTTPStatusCode())
 	}
 
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "unknown credential placeholder") {
-		t.Errorf("body = %q, want to contain 'unknown credential placeholder'", body)
+	if !strings.Contains(string(body), workflows.ReasonCredentialInjectionFailed.String()) {
+		t.Errorf("body = %q, want to contain %q", body, workflows.ReasonCredentialInjectionFailed.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// gwProxyClientTLS and TestGateway_ConnectHTTPS — HTTPS CONNECT MITM path
+// ---------------------------------------------------------------------------
+
+// gwProxyClientTLS returns an *http.Client that tunnels HTTPS requests through
+// proxyAddr via the HTTP CONNECT method. It trusts the MITM CA at caCertPath
+// (so the gateway's dynamically-issued certificates are accepted) and injects
+// the test JWT into the CONNECT request via Proxy-Authorization.
+func gwProxyClientTLS(t *testing.T, proxyAddr, caCertPath string) *http.Client {
+	t.Helper()
+	caCert, err := os.ReadFile(caCertPath)
+	if err != nil {
+		t.Fatalf("read MITM CA cert: %v", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caCert) {
+		t.Fatal("failed to append MITM CA cert to pool")
+	}
+	proxyURL, err := url.Parse("http://" + proxyAddr)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			ProxyConnectHeader: http.Header{
+				"Proxy-Authorization": []string{"Bearer " + gwTestToken},
+			},
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		},
+		Timeout: 5 * time.Second,
+	}
+}
+
+// TestGateway_ConnectHTTPS exercises the full HTTPS CONNECT → TLS MITM →
+// credential injection path. The client dials through the proxy via CONNECT,
+// negotiates TLS with the gateway's MITM certificate (signed by the test CA),
+// sends a request with an agent-vault placeholder, and verifies the TLS
+// upstream receives the real credential instead of the placeholder.
+func TestGateway_ConnectHTTPS(t *testing.T) {
+	certPath, keyPath := generateTestCA(t)
+	cfg := testConfig(t, certPath, keyPath)
+
+	receivedKey := make(chan string, 1)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedKey <- r.Header.Get("X-Api-Key")
+		fmt.Fprint(w, "tls-ok")
+	}))
+	defer upstream.Close()
+
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
+	addr := startGateway(t, cfg, worker, reg)
+	client := gwProxyClientTLS(t, addr, certPath)
+
+	req, err := http.NewRequest("GET", upstream.URL+"/v1/chat", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("X-Api-Key", gwPlaceholder)
+	// Proxy-Authorization is sent in the CONNECT headers via ProxyConnectHeader,
+	// not in the tunnelled request itself — handleConnect stores it in connTokens.
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200; body = %q", resp.StatusCode, body)
+	}
+
+	got := <-receivedKey
+	if got != gwRealSecret {
+		t.Errorf("upstream received key = %q, want %q", got, gwRealSecret)
 	}
 }

@@ -55,6 +55,23 @@ func NewOpenBaoClient(cfg config.VaultConfig) (*OpenBaoClient, error) {
 	return &OpenBaoClient{client: client}, nil
 }
 
+// HealthCheck verifies that the OpenBao server is reachable, initialized, and
+// unsealed. It is called once at startup to fail fast rather than on the first
+// proxied request (r42).
+func (c *OpenBaoClient) HealthCheck(ctx context.Context) error {
+	health, err := c.client.Sys().HealthWithContext(ctx)
+	if err != nil {
+		return fmt.Errorf("vault health check: %w", err)
+	}
+	if !health.Initialized {
+		return fmt.Errorf("vault is not initialized")
+	}
+	if health.Sealed {
+		return fmt.Errorf("vault is sealed")
+	}
+	return nil
+}
+
 // FetchCredential reads a KV v2 secret from the given vaultPath and extracts
 // the key, header_name, and header_prefix fields.
 //

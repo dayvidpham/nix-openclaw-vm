@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,6 +13,7 @@ import (
 	"github.com/mdlayher/vsock"
 	temporalclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
+	"net/http"
 
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
@@ -71,6 +71,12 @@ func run(args []string) error {
 	}
 	slog.Info("vault client initialized", "address", cfg.Vault.Address)
 
+	// Verify vault connectivity at startup (r42: fail fast rather than on first request).
+	if err := vaultClient.HealthCheck(ctx); err != nil {
+		return fmt.Errorf("vault health check failed: %w", err)
+	}
+	slog.Info("vault health check passed")
+
 	// Connect to Temporal.
 	tc, err := temporalclient.Dial(temporalclient.Options{
 		HostPort:  cfg.Temporal.HostPort,
@@ -82,29 +88,29 @@ func run(args []string) error {
 	defer tc.Close()
 	slog.Info("Temporal client connected", "host_port", cfg.Temporal.HostPort, "namespace", cfg.Temporal.Namespace)
 
-	// Initialize the proxy gateway (needs Temporal client for audit workflows).
-	gateway, err := proxy.NewGateway(cfg, verifier, evaluator, vaultClient, tc)
+	// Create the shared RequestRegistry. It bridges the goproxy handler goroutines
+	// and the Temporal local activity worker goroutines in the same process.
+	registry := &proxy.RequestRegistry{}
+
+	// Initialize the proxy gateway. It holds a reference to the registry so that
+	// handleRequest can store RequestContext entries for FetchAndInject to look up.
+	gateway, err := proxy.NewGateway(cfg, tc, registry)
 	if err != nil {
 		return fmt.Errorf("init gateway: %w", err)
 	}
 	slog.Info("proxy gateway initialized")
 
-	// Start Temporal worker.
+	// Start Temporal worker. ProxyRequestWorkflow is the only registered workflow;
+	// AuditWorkflow has been removed (its functionality is now part of the full
+	// ProxyRequestWorkflow lifecycle via search attributes + response_complete signal).
 	w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{})
 	w.RegisterWorkflow(workflows.ProxyRequestWorkflow)
-	w.RegisterWorkflow(workflows.AuditWorkflow)
 	activities := &workflows.Activities{
-		Store: vaultClient,
-		HTTPClient: &http.Client{
-			Timeout: 30 * time.Second,
-			// Disable redirect-following to prevent credential exfiltration
-			// via malicious redirects to attacker-controlled domains.
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		Store:     vaultClient,
 		Config:    cfg,
 		Evaluator: evaluator,
+		Verifier:  verifier,
+		Registry:  registry,
 	}
 	w.RegisterActivity(activities)
 

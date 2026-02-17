@@ -9,26 +9,26 @@ import (
 	"github.com/elazarl/goproxy"
 	temporalclient "go.temporal.io/sdk/client"
 
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
-	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
 )
 
-// Gateway is the credential-proxy HTTP handler. It composes authentication,
-// authorization, vault secret resolution, and credential substitution around
-// a goproxy MITM proxy.
+// Gateway is the credential-proxy HTTP handler. It composes domain allowlist
+// enforcement, JWT extraction, Temporal workflow orchestration, credential
+// injection (via local activities), and response scrubbing around a goproxy
+// MITM proxy.
+//
+// Authentication, authorization, and credential fetching are all performed
+// inside Temporal activities — not inline in the proxy handlers. This keeps
+// secret values out of Temporal event history and provides a full audit trail.
 type Gateway struct {
 	cfg      *config.Config
-	authn    authn.Verifier
-	authz    authz.Evaluator
-	vault    vault.SecretStore
 	proxy    *goproxy.ProxyHttpServer
 	temporal temporalclient.Client
+	registry *RequestRegistry
 
 	// connTokens maps remote addresses to JWT tokens extracted during CONNECT
-	// handshakes. This bridges HandleConnect and OnRequest, which use separate
-	// goproxy ProxyCtx instances.
+	// handshakes. This bridges HandleConnect and OnRequest, which run in
+	// separate goproxy ProxyCtx instances.
 	connTokens sync.Map // remoteAddr → string (raw JWT)
 }
 
@@ -36,7 +36,9 @@ type Gateway struct {
 var _ http.Handler = (*Gateway)(nil)
 
 // NewGateway constructs a fully-wired Gateway and registers goproxy handlers.
-func NewGateway(cfg *config.Config, authV authn.Verifier, authzE authz.Evaluator, vaultS vault.SecretStore, tc temporalclient.Client) (*Gateway, error) {
+// The registry must be the same instance passed to workflows.Activities so that
+// local activities can find RequestContext entries created by the OnRequest handler.
+func NewGateway(cfg *config.Config, tc temporalclient.Client, reg *RequestRegistry) (*Gateway, error) {
 	// Load MITM CA certificate if configured.
 	if cfg.CACertPath != "" && cfg.CAKeyPath != "" {
 		ca, err := tls.LoadX509KeyPair(cfg.CACertPath, cfg.CAKeyPath)
@@ -48,11 +50,9 @@ func NewGateway(cfg *config.Config, authV authn.Verifier, authzE authz.Evaluator
 
 	gw := &Gateway{
 		cfg:      cfg,
-		authn:    authV,
-		authz:    authzE,
-		vault:    vaultS,
 		proxy:    goproxy.NewProxyHttpServer(),
 		temporal: tc,
+		registry: reg,
 	}
 
 	registerHandlers(gw)

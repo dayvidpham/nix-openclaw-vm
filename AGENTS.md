@@ -78,6 +78,97 @@ leaf-task-a
 
 **Rule of thumb:** The `--blocked-by` target is always the thing you do *first*. Work flows bottom-up; closure flows top-down.
 
+## Testing
+
+### How to run tests
+
+**Nix module evaluation check** — validates the full module tree without booting:
+```bash
+nix flake check
+```
+This runs `checks.x86_64-linux.eval-test-vm`, which builds `nixosConfigurations.test-vm.config.system.build.toplevel`. If module options, `mkIf` conditions, or types are broken it fails here.
+
+**credential-proxy Go tests** — run from the subdirectory:
+```bash
+cd credential-proxy
+go test ./...
+```
+
+Run a single package or test:
+```bash
+go test ./proxy/ -run TestGateway_PlaceholderSubstitution -v
+go test ./authz/ -v
+```
+
+**Dev shell** — provides Go toolchain, gopls, staticcheck, delve, temporal-cli:
+```bash
+cd credential-proxy
+nix develop   # or direnv allow if .envrc is present
+```
+
+**Build the VM image** (no boot required):
+```bash
+nix build .#test-vm
+```
+
+**Boot the test VM**:
+```bash
+nix build .#test-vm && ./result/bin/microvm-run
+```
+The `test-vm` config has `dangerousDevMode` enabled and sops/Tailscale/Caddy disabled, so it boots without external infrastructure.
+
+### Test package map
+
+| Package | Type | What it covers |
+|---------|------|----------------|
+| `proxy` | Integration | Full gateway round-trip: placeholder substitution, response scrubbing, domain allowlist, 407/403 enforcement. Spins up real `httptest` servers and a real `Gateway`. Mocks only `authn.Verifier`, `vault.SecretStore`, and the Temporal client. |
+| `workflows` | Integration (Temporal testsuite) | `FetchAndForward` and `ValidateAndResolve` activities via `testsuite.TestActivityEnvironment`. |
+| `authz` | Integration | OPA evaluator against the **real** Rego policy (`authz/policies/`). Tests allow/deny decisions, domain binding enforcement, role requirements. |
+| `authn` | Unit | OIDC error classification (`ErrTokenExpired`, `ErrInvalidIssuer`, `ErrInvalidAudience`) and Keycloak `realm_access.roles` extraction. |
+
+### Type safety rules
+
+- **No stringly-typed APIs.** All status codes, denial reasons, decision types, signal names, and error categories MUST be strongly-typed Go enums (`type Foo int` with `iota` constants). String representations are only acceptable at serialization boundaries (JSON, Temporal search attributes, HTTP responses) via `.String()` methods.
+- **No string literals at API boundaries.** Every string that crosses a function signature, channel, or struct field must reference a named constant or typed enum value. Bare `"authentication_failed"` or `"response_complete"` literals are not acceptable.
+- **Use `ast-grep` to audit.** Run the project's rules before submitting changes. Any new string literal in a function signature, struct field type, or channel type is a code smell.
+
+  ```bash
+  # Run all three stringly-typed API rules (from credential-proxy/ directory context):
+  ast-grep scan -r credential-proxy/rules/no-signal-string-literal.yml credential-proxy/
+  ast-grep scan -r credential-proxy/rules/no-stringly-typed-status-enum.yml credential-proxy/
+  ast-grep scan -r credential-proxy/rules/no-untyped-string-const.yml credential-proxy/
+
+  # Or run all rules at once via the project config:
+  ast-grep scan --config credential-proxy/sgconfig.yml credential-proxy/
+  ```
+
+  | Rule file | Detects | Severity |
+  |-----------|---------|----------|
+  | `rules/no-signal-string-literal.yml` | Bare string literals in `GetSignalChannel()` or `SignalWorkflow()` signal-name argument | error |
+  | `rules/no-stringly-typed-status-enum.yml` | `type XStatus string`, `type XDecision string`, `type XReason string` declarations | warning |
+  | `rules/no-untyped-string-const.yml` | Untyped `const X = "..."` where X contains Status/Reason/Decision/Signal | warning |
+
+  All three rules must produce **zero violations in non-vendor code** before merging.
+
+### Test writing rules for agents
+
+- **Do not mock the system under test.** `proxy` tests mock `authn.Verifier` and `vault.SecretStore`, but the `Gateway` itself is real. `authz` tests run against the real `OPAEvaluator` with the real Rego files.
+- **Use shared fixtures.** `gateway_test.go` defines `defaultMockVerifier()`, `defaultMockEvaluator()`, `defaultMockStore()`, and `testConfig()` for reuse across cases. Add new cases using those helpers; do not inline config YAML in individual tests.
+- **Assert observable outcomes.** Test HTTP status codes, response bodies, and header values. Do not assert on internal struct fields.
+- **Compile-time interface checks.** Each test file uses `var _ SomeInterface = (*mockFoo)(nil)` to catch interface drift early. Add this pattern for any new mock.
+
+### VSOCK testing
+
+The VSOCK transport between VM guest and host is exercised only in a live VM boot (`nix build .#test-vm && ./result/bin/microvm-run`). For isolated VSOCK channel testing without a full boot, use `socat`:
+
+```bash
+# Emulate host side (listens on VSOCK CID 2, port 8080)
+socat VSOCK-LISTEN:8080,fork TCP:localhost:8080
+
+# Emulate guest side (connects out through VSOCK)
+socat TCP-LISTEN:9090,fork VSOCK-CONNECT:2:8080
+```
+
 ## Design References
 
 The credential-proxy design draws on patterns from established OSS projects. Detailed research reports live in `docs/research/`.

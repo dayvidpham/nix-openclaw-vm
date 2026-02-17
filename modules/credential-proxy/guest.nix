@@ -85,6 +85,20 @@ in
         ANTHROPIC_API_KEY = "agent-vault-00000000-0000-0000-0000-000000000001";
       };
     };
+
+    fwCfg = {
+      enable = mkEnableOption ''
+        Populate placeholder env vars from the fw_cfg JSON credential at boot.
+
+        When enabled, a oneshot systemd service reads the credproxy-placeholder-env
+        credential (passed by the host via fw_cfg / microvm.credentialFiles) and writes
+        /run/credproxy/placeholder.env. A profile.d snippet sources this file at login,
+        making fw_cfg the single source of truth for placeholder env var assignments.
+
+        This is set automatically by the host credential-proxy module when microvm is
+        available. There is normally no need to set this manually.
+      '';
+    };
   };
 
   config = mkIf cfg.enable {
@@ -145,6 +159,54 @@ in
       text = ''
         export CREDPROXY_TOKEN_FILE="''${XDG_RUNTIME_DIR:-/tmp}/credproxy-jwt"
       '';
+    };
+
+    # fw_cfg → env var boot service.
+    # Reads the credproxy-placeholder-env credential (provided by the host via
+    # microvm.credentialFiles / QEMU fw_cfg) and writes each env_var=placeholder pair
+    # to /run/credproxy/placeholder.env. A profile.d snippet then sources that file
+    # at login time so agents see the placeholder tokens without any static Nix config.
+    systemd.services.credproxy-placeholder-env = mkIf cfg.fwCfg.enable {
+      description = "Populate credential placeholder env vars from fw_cfg";
+      wantedBy = [ "multi-user.target" ];
+      before = [ "multi-user.target" ];
+
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        # Import the fw_cfg credential into $CREDENTIALS_DIRECTORY
+        ImportCredential = "credproxy-placeholder-env";
+        ExecStart = pkgs.writeShellScript "credproxy-placeholder-env-init" ''
+          set -euo pipefail
+          mkdir -p /run/credproxy
+          ${pkgs.jq}/bin/jq -r \
+            '.placeholders[] | "\(.env_var)=\(.placeholder)"' \
+            "$CREDENTIALS_DIRECTORY/credproxy-placeholder-env" \
+            > /run/credproxy/placeholder.env
+          chmod 0644 /run/credproxy/placeholder.env
+        '';
+
+        # Minimal hardening for a boot-time oneshot
+        NoNewPrivileges = true;
+        ProtectSystem = "strict";
+        ReadWritePaths = [ "/run/credproxy" ];
+      };
+    };
+
+    # Source placeholder env vars at login time for interactive shells and agent processes.
+    # This is the guest-side companion to fwCfg: agents see the tokens without any
+    # static configuration baked into the Nix closure.
+    environment.etc."profile.d/credproxy-placeholder-env.sh" = mkIf cfg.fwCfg.enable {
+      text = ''
+        # Credential placeholder env vars — written at boot by credproxy-placeholder-env.service
+        if [[ -r /run/credproxy/placeholder.env ]]; then
+          set -a
+          # shellcheck source=/dev/null
+          source /run/credproxy/placeholder.env
+          set +a
+        fi
+      '';
+      mode = "0644";
     };
 
     # Generate /etc/credproxy/client.env for credproxy-auth when Keycloak is configured

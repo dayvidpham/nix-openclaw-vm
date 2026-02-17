@@ -28,21 +28,27 @@ func newEvaluator(t *testing.T) *OPAEvaluator {
 	return eval
 }
 
+// identityWithRoles builds a Keycloak-shaped JWT claims map with roles nested
+// under realm_access.roles, matching the actual token structure at runtime.
 func identityWithRoles(roles ...string) map[string]interface{} {
 	ifaces := make([]interface{}, len(roles))
 	for i, r := range roles {
 		ifaces[i] = r
 	}
 	return map[string]interface{}{
-		"roles": ifaces,
-		"sub":   "test-agent",
+		"realm_access": map[string]interface{}{
+			"roles": ifaces,
+		},
+		"sub": "test-agent",
 	}
 }
 
 func identityNoRoles() map[string]interface{} {
 	return map[string]interface{}{
-		"roles": []interface{}{},
-		"sub":   "test-agent",
+		"realm_access": map[string]interface{}{
+			"roles": []interface{}{},
+		},
+		"sub": "test-agent",
 	}
 }
 

@@ -28,3 +28,86 @@ Then include in your NixOS configuration:
 ```
 
 **Important:** The openclaw container modules require standalone `keycloak` and `openbao` modules in your module tree if using zero-trust mode.
+
+## Testing
+
+### Nix flake check
+
+`nix flake check` runs the `eval-test-vm` check defined in `flake.nix`. This check evaluates the full `nixosConfigurations.test-vm` module tree — including all openclaw-vm, credential-proxy, and microvm modules — and verifies that NixOS module evaluation succeeds without errors. It does **not** boot the VM; it validates that the module options, types, and conditional logic are consistent.
+
+```bash
+nix flake check
+```
+
+If you are iterating on module option types or `mkIf` conditions, this is the fastest feedback loop.
+
+### credential-proxy Go tests
+
+The `credential-proxy/` subdirectory is a standalone Go module with its own flake. Run the full test suite from within that directory:
+
+```bash
+cd credential-proxy
+go test ./...
+```
+
+The tests are organized by package:
+
+| Package | Coverage |
+|---------|----------|
+| `proxy` | Integration tests for the HTTP gateway: placeholder substitution, response scrubbing, domain allowlist enforcement, auth rejection, authz deny |
+| `workflows` | Temporal activity tests (`FetchAndForward`, `ValidateAndResolve`) using `testsuite.TestActivityEnvironment` |
+| `authz` | OPA evaluator tests against the real Rego policy: allow/deny decisions, domain binding, role checking |
+| `authn` | Unit tests for OIDC error classification and Keycloak `realm_access.roles` extraction |
+
+The `proxy` tests spin up real `httptest` servers and a real `Gateway` instance. They mock only external dependencies (`authn.Verifier`, `vault.SecretStore`, Temporal client) — the system under test is the gateway itself.
+
+### Dev shell (iterating on credential-proxy)
+
+Enter the dev shell to get Go toolchain, `gopls`, `staticcheck`, `delve`, and `temporal-cli`:
+
+```bash
+cd credential-proxy
+nix develop
+```
+
+From inside the shell:
+
+```bash
+go test ./...                     # run all tests
+go test ./proxy/ -run TestGateway # run a specific test
+go vet ./...                      # run vet
+staticcheck ./...                 # run staticcheck
+```
+
+### Building the VM image
+
+Build the test-vm runner (does not require booting):
+
+```bash
+nix build .#test-vm
+```
+
+This evaluates the microvm configuration and produces a runnable script at `result/`. The `eval-test-vm` check in `nix flake check` validates the same configuration at a lower cost.
+
+### Running VM boot tests
+
+To actually boot the VM locally:
+
+```bash
+nix build .#test-vm
+./result/bin/microvm-run
+```
+
+The test-vm configuration (`nixosConfigurations.test-vm`) enables `dangerousDevMode`, disables sops secrets, Tailscale, and Caddy, so it boots with minimal external dependencies.
+
+### VSOCK
+
+The credential-proxy is designed to forward traffic over VSOCK between VM guest and host. The current test suite validates the HTTP/HTTPS proxy pipeline end-to-end using `httptest` servers; VSOCK transport is exercised only in a live VM boot. If you need to test the VSOCK path without a full boot, use `socat` to emulate the channel:
+
+```bash
+# guest side (inside VM)
+socat VSOCK-CONNECT:2:8080 TCP:localhost:8080
+
+# host side
+socat TCP-LISTEN:8080,fork VSOCK-LISTEN:8080
+```

@@ -1,0 +1,17 @@
+id: no-untyped-string-const
+language: Go
+severity: warning
+message: >
+  This string constant has no type annotation. Constants that identify statuses,
+  decisions, reasons, or signal names must be typed (e.g., `const X MyType = "..."`).
+  Untyped string constants can be accidentally mixed with other string values.
+note: >
+  If this is a status/decision/reason value: convert the whole family to a typed int
+  enum with iota. If this is a signal name: use `const X SignalName = "..."`.
+  If this is a test fixture string or format template, it may be left as-is.
+rule:
+  all:
+    - pattern: const $NAME = "$VALUE"
+    - regex: "(Status|Reason|Decision|Signal|Denial)"
+ignore:
+  - "**/vendor/**"

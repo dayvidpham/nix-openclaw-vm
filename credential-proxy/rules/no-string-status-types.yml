@@ -1,0 +1,22 @@
+id: no-stringly-typed-status-enum
+language: Go
+severity: warning
+message: >
+  This type uses `string` as its underlying type but is named as a status, decision,
+  or reason identifier. Use `type T int` with iota constants and a String() method.
+  String-typed enums allow invalid values and silent comparison bugs.
+note: >
+  Replace with:
+    type T int
+    const (
+        TFirst T = iota
+        TSecond
+    )
+    func (t T) String() string { switch t { ... } }
+  Serialization boundaries (JSON, Temporal search attributes) call .String() explicitly.
+rule:
+  all:
+    - pattern: type $NAME string
+    - regex: "(Status|Decision|Reason)"
+ignore:
+  - "**/vendor/**"

@@ -102,6 +102,10 @@ type Config struct {
 	CAKeyPath  string `yaml:"ca_key_path"`
 	CACertPath string `yaml:"ca_cert_path"`
 
+	// MaxBodySize is the maximum number of bytes read from request/response bodies.
+	// Prevents OOM on large or malicious payloads. Defaults to 10 MiB when zero.
+	MaxBodySize int64 `yaml:"max_body_size"`
+
 	// Index built at load time: placeholder string → Credential
 	credentialIndex map[string]*Credential
 	// Index built at load time: domain → allowed
@@ -140,8 +144,14 @@ var validCredentialTypes = map[CredentialType]bool{
 	CredentialTypeHeader:    true,
 }
 
+// defaultMaxBodySize is the fallback body read limit when not set in config (10 MiB).
+const defaultMaxBodySize int64 = 10 * 1024 * 1024
+
 // Validate checks that required configuration fields are present and valid.
 func (c *Config) Validate() error {
+	if c.MaxBodySize == 0 {
+		c.MaxBodySize = defaultMaxBodySize
+	}
 	if c.OIDC.IssuerURL == "" {
 		return fmt.Errorf("config: oidc.issuer_url is required")
 	}

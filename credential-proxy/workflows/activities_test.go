@@ -4,35 +4,22 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"go.temporal.io/sdk/testsuite"
 
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authz"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/internal/testutil"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
 )
 
-// mockSecretStore implements vault.SecretStore for testing.
-type mockSecretStore struct {
-	credentials map[string]*vault.CredentialValue
-	err         error
-}
-
-var _ vault.SecretStore = (*mockSecretStore)(nil)
-
-func (m *mockSecretStore) FetchCredential(_ context.Context, vaultPath string) (*vault.CredentialValue, error) {
-	if m.err != nil {
-		return nil, m.err
-	}
-	cred, ok := m.credentials[vaultPath]
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", vault.ErrSecretNotFound, vaultPath)
-	}
-	return cred, nil
-}
+// ---------------------------------------------------------------------------
+// Mock types whose interfaces live in this package (cannot be in testutil
+// without creating a circular import).
+// ---------------------------------------------------------------------------
 
 // mockEvaluator implements authz.Evaluator for testing.
 type mockEvaluator struct {
@@ -48,6 +35,38 @@ func (m *mockEvaluator) Evaluate(_ context.Context, _ *authz.AuthzRequest) (*aut
 	}
 	return m.result, nil
 }
+
+// mockVerifier implements authn.Verifier for testing.
+type mockVerifier struct {
+	identity *authn.AgentIdentity
+	err      error
+}
+
+var _ authn.Verifier = (*mockVerifier)(nil)
+
+func (m *mockVerifier) VerifyToken(_ context.Context, _ string) (*authn.AgentIdentity, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	return m.identity, nil
+}
+
+// mockRegistry implements ContextRegistry for testing.
+// Cannot be in testutil because ContextRegistry is defined in this package.
+type mockRegistry struct {
+	entries map[string]*RequestContext
+}
+
+var _ ContextRegistry = (*mockRegistry)(nil)
+
+func (r *mockRegistry) Load(id string) (*RequestContext, bool) {
+	ctx, ok := r.entries[id]
+	return ctx, ok
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
 
 // testConfig returns a parsed config with two credential entries for testing.
 func testConfig(t *testing.T) *config.Config {
@@ -78,221 +97,384 @@ credentials:
 	return cfg
 }
 
-func TestFetchAndForward_Success(t *testing.T) {
-	// Target server that echoes back the received Authorization header.
-	var receivedAuth string
-	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedAuth = r.Header.Get("Authorization")
-		w.Header().Set("Content-Length", "2")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	}))
-	defer target.Close()
-
-	// Extract host:port from the test server URL (e.g., "127.0.0.1:PORT").
-	targetDomain := strings.TrimPrefix(target.URL, "https://")
-
-	store := &mockSecretStore{
-		credentials: map[string]*vault.CredentialValue{
-			"secret/data/anthropic": {
-				Key:          "sk-ant-test-key",
+// defaultStore returns a MockStore pre-loaded with the two test credentials.
+func defaultStore() *testutil.MockStore {
+	return &testutil.MockStore{
+		Credentials: map[string]*vault.CredentialValue{
+			"secret/data/cred-a": {
+				Key:          "token-a",
 				HeaderName:   "Authorization",
 				HeaderPrefix: "Bearer ",
+			},
+			"secret/data/cred-b": {
+				Key:        "key-b",
+				HeaderName: "x-api-key",
+			},
+		},
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ValidateIdentity tests
+// ---------------------------------------------------------------------------
+
+func TestValidateIdentity_Success(t *testing.T) {
+	acts := &Activities{
+		Verifier: &mockVerifier{
+			identity: &authn.AgentIdentity{
+				Subject:   "agent-001",
+				Roles:     []string{"proxy-user"},
+				RawClaims: map[string]interface{}{"sub": "agent-001"},
 			},
 		},
 	}
 
-	acts := &Activities{
-		Store:      store,
-		HTTPClient: target.Client(),
-	}
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.ValidateIdentity)
 
-	env := &testsuite.TestActivityEnvironment{}
-	testSuite := &testsuite.WorkflowTestSuite{}
-	env = testSuite.NewTestActivityEnvironment()
-	env.RegisterActivity(acts.FetchAndForward)
-
-	result, err := env.ExecuteActivity(acts.FetchAndForward, FetchAndForwardInput{
-		RequestID:    "req-001",
-		TargetDomain: targetDomain,
-		Method:       "GET",
-		Path:         "/v1/messages",
-		CredentialPaths: map[string]string{
-			"hash-abc": "secret/data/anthropic",
-		},
-	})
+	result, err := env.ExecuteActivity(acts.ValidateIdentity, ValidateIdentityInput{RawJWT: "test.jwt.token"})
 	if err != nil {
-		t.Fatalf("FetchAndForward error: %v", err)
+		t.Fatalf("ValidateIdentity error: %v", err)
 	}
 
-	var output FetchAndForwardOutput
-	if err := result.Get(&output); err != nil {
-		t.Fatalf("decode output: %v", err)
+	var claims IdentityClaims
+	if err := result.Get(&claims); err != nil {
+		t.Fatalf("decode claims: %v", err)
 	}
 
-	if output.StatusCode != http.StatusOK {
-		t.Errorf("expected status 200, got %d", output.StatusCode)
+	if claims.Subject != "agent-001" {
+		t.Errorf("subject = %q, want %q", claims.Subject, "agent-001")
 	}
-	if output.BytesTransferred != 2 {
-		t.Errorf("expected 2 bytes transferred, got %d", output.BytesTransferred)
-	}
-	if receivedAuth != "Bearer sk-ant-test-key" {
-		t.Errorf("expected Authorization header 'Bearer sk-ant-test-key', got %q", receivedAuth)
+	if len(claims.Roles) != 1 || claims.Roles[0] != "proxy-user" {
+		t.Errorf("roles = %v, want [proxy-user]", claims.Roles)
 	}
 }
 
-func TestFetchAndForward_VaultError(t *testing.T) {
-	store := &mockSecretStore{
-		err: fmt.Errorf("vault unavailable"),
-	}
-
+func TestValidateIdentity_InvalidToken(t *testing.T) {
 	acts := &Activities{
-		Store:      store,
-		HTTPClient: http.DefaultClient,
+		Verifier: &mockVerifier{err: fmt.Errorf("token signature invalid")},
 	}
 
-	testSuite := &testsuite.WorkflowTestSuite{}
-	env := testSuite.NewTestActivityEnvironment()
-	env.RegisterActivity(acts.FetchAndForward)
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.ValidateIdentity)
 
-	_, err := env.ExecuteActivity(acts.FetchAndForward, FetchAndForwardInput{
-		RequestID:    "req-002",
-		TargetDomain: "api.anthropic.com",
-		Method:       "POST",
-		Path:         "/v1/messages",
-		CredentialPaths: map[string]string{
-			"hash-xyz": "secret/data/anthropic",
+	_, err := env.ExecuteActivity(acts.ValidateIdentity, ValidateIdentityInput{RawJWT: "bad.token"})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "token signature invalid") {
+		t.Errorf("error = %v, want to contain 'token signature invalid'", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// EvaluatePolicy tests
+// ---------------------------------------------------------------------------
+
+func TestEvaluatePolicy_Allowed(t *testing.T) {
+	cfg := testConfig(t)
+	acts := &Activities{
+		Config:    cfg,
+		Evaluator: &mockEvaluator{result: &authz.AuthzResult{Allowed: true}},
+	}
+
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.EvaluatePolicy)
+
+	result, err := env.ExecuteActivity(acts.EvaluatePolicy, EvalPolicyInput{
+		Claims: IdentityClaims{
+			Subject:   "agent-001",
+			RawClaims: map[string]interface{}{"sub": "agent-001"},
 		},
+		Placeholders: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444"},
+		TargetDomain: "api.example.com",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePolicy error: %v", err)
+	}
+
+	var decision AuthzDecision
+	if err := result.Get(&decision); err != nil {
+		t.Fatalf("decode decision: %v", err)
+	}
+
+	if !decision.Allowed {
+		t.Errorf("expected allowed=true, got false (reason: %s)", decision.Reason)
+	}
+}
+
+func TestEvaluatePolicy_Denied(t *testing.T) {
+	cfg := testConfig(t)
+	acts := &Activities{
+		Config:    cfg,
+		Evaluator: &mockEvaluator{result: &authz.AuthzResult{Allowed: false, Reason: "insufficient role"}},
+	}
+
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.EvaluatePolicy)
+
+	result, err := env.ExecuteActivity(acts.EvaluatePolicy, EvalPolicyInput{
+		Claims:       IdentityClaims{RawClaims: map[string]interface{}{}},
+		Placeholders: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444"},
+		TargetDomain: "api.example.com",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePolicy error: %v", err)
+	}
+
+	var decision AuthzDecision
+	if err := result.Get(&decision); err != nil {
+		t.Fatalf("decode decision: %v", err)
+	}
+
+	if decision.Allowed {
+		t.Error("expected allowed=false, got true")
+	}
+	if decision.Reason != "insufficient role" {
+		t.Errorf("reason = %q, want %q", decision.Reason, "insufficient role")
+	}
+}
+
+func TestEvaluatePolicy_UnknownPlaceholder(t *testing.T) {
+	cfg := testConfig(t)
+	acts := &Activities{
+		Config:    cfg,
+		Evaluator: &mockEvaluator{result: &authz.AuthzResult{Allowed: true}},
+	}
+
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.EvaluatePolicy)
+
+	result, err := env.ExecuteActivity(acts.EvaluatePolicy, EvalPolicyInput{
+		Claims:       IdentityClaims{},
+		Placeholders: []string{"agent-vault-zzzzzzzz-0000-0000-0000-000000000000"},
+		TargetDomain: "api.example.com",
+	})
+	if err != nil {
+		t.Fatalf("EvaluatePolicy error: %v", err)
+	}
+
+	var decision AuthzDecision
+	if err := result.Get(&decision); err != nil {
+		t.Fatalf("decode decision: %v", err)
+	}
+
+	// Unknown placeholders are treated as denied.
+	if decision.Allowed {
+		t.Error("expected allowed=false for unknown placeholder, got true")
+	}
+	if !strings.Contains(decision.Reason, "unknown credential placeholder") {
+		t.Errorf("reason = %q, want to contain 'unknown credential placeholder'", decision.Reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FetchAndInject tests
+// ---------------------------------------------------------------------------
+
+func TestFetchAndInject_Success(t *testing.T) {
+	cfg := testConfig(t)
+	store := defaultStore()
+
+	// Build a real *http.Request to test in-place modification.
+	req, err := http.NewRequest("GET", "https://api.example.com/v1/resource", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("Authorization", "agent-vault-aaaaaaaa-1111-2222-3333-444444444444")
+
+	decisionCh := make(chan *WorkflowDecision, 1)
+	reqCtx := &RequestContext{
+		Request:  req,
+		ScrubMap: make(map[string]string),
+		DecisionCh: decisionCh,
+		ReplaceFunc: func(replacements map[string]string) error {
+			for _, v := range req.Header {
+				for i, h := range v {
+					if rep, ok := replacements[h]; ok {
+						v[i] = rep
+					}
+				}
+			}
+			return nil
+		},
+	}
+
+	reg := &mockRegistry{entries: map[string]*RequestContext{"req-001": reqCtx}}
+	acts := &Activities{
+		Store:    store,
+		Config:   cfg,
+		Registry: reg,
+	}
+
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.FetchAndInject)
+
+	result, err := env.ExecuteActivity(acts.FetchAndInject, FetchInjectInput{
+		RequestID:    "req-001",
+		Placeholders: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444"},
+	})
+	if err != nil {
+		t.Fatalf("FetchAndInject error: %v", err)
+	}
+
+	var injectResult InjectResult
+	if err := result.Get(&injectResult); err != nil {
+		t.Fatalf("decode result: %v", err)
+	}
+
+	if injectResult.CredentialCount != 1 {
+		t.Errorf("credential_count = %d, want 1", injectResult.CredentialCount)
+	}
+
+	// Decision channel should have received "allowed".
+	select {
+	case decision := <-decisionCh:
+		if decision.Status != DecisionAllowed {
+			t.Errorf("decision.Status = %q, want %q", decision.Status, DecisionAllowed)
+		}
+	default:
+		t.Error("expected decision on DecisionCh, got none")
+	}
+
+	// ScrubMap should contain realValue → placeholder.
+	expectedReal := "Bearer token-a"
+	if ph, ok := reqCtx.ScrubMap[expectedReal]; !ok || ph != "agent-vault-aaaaaaaa-1111-2222-3333-444444444444" {
+		t.Errorf("ScrubMap[%q] = %q; want placeholder", expectedReal, ph)
+	}
+}
+
+func TestFetchAndInject_VaultError(t *testing.T) {
+	cfg := testConfig(t)
+	store := &testutil.MockStore{Err: fmt.Errorf("vault unavailable")}
+
+	req, _ := http.NewRequest("GET", "https://api.example.com/", nil)
+	decisionCh := make(chan *WorkflowDecision, 1)
+	reqCtx := &RequestContext{
+		Request:     req,
+		ScrubMap:    make(map[string]string),
+		DecisionCh:  decisionCh,
+		ReplaceFunc: func(_ map[string]string) error { return nil },
+	}
+
+	reg := &mockRegistry{entries: map[string]*RequestContext{"req-002": reqCtx}}
+	acts := &Activities{
+		Store:    store,
+		Config:   cfg,
+		Registry: reg,
+	}
+
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.FetchAndInject)
+
+	_, err := env.ExecuteActivity(acts.FetchAndInject, FetchInjectInput{
+		RequestID:    "req-002",
+		Placeholders: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444"},
 	})
 	if err == nil {
 		t.Fatal("expected error from vault failure, got nil")
 	}
-	if !strings.Contains(err.Error(), "vault unavailable") {
-		t.Errorf("expected error to mention 'vault unavailable', got: %v", err)
+
+	// Even on error, DecisionCh should have a denied decision (so goproxy unblocks).
+	select {
+	case decision := <-decisionCh:
+		if decision.Status != DecisionDenied {
+			t.Errorf("decision.Status = %q, want %q", decision.Status, DecisionDenied)
+		}
+	default:
+		t.Error("expected denied decision on DecisionCh after vault error, got none")
 	}
 }
 
-func TestValidateAndResolve_Success(t *testing.T) {
+func TestFetchAndInject_RegistryMiss(t *testing.T) {
 	cfg := testConfig(t)
-	eval := &mockEvaluator{
-		result: &authz.AuthzResult{Allowed: true},
-	}
+	reg := &mockRegistry{entries: map[string]*RequestContext{}} // empty
+	acts := &Activities{Config: cfg, Registry: reg}
 
-	acts := &Activities{
-		Config:    cfg,
-		Evaluator: eval,
-	}
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.FetchAndInject)
 
-	testSuite := &testsuite.WorkflowTestSuite{}
-	env := testSuite.NewTestActivityEnvironment()
-	env.RegisterActivity(acts.ValidateAndResolve)
-
-	result, err := env.ExecuteActivity(acts.ValidateAndResolve, ValidateAndResolveInput{
-		AgentID:           "agent-1",
-		TargetDomain:      "api.example.com",
-		PlaceholderHashes: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444", "agent-vault-bbbbbbbb-1111-2222-3333-444444444444"},
-	})
-	if err != nil {
-		t.Fatalf("ValidateAndResolve error: %v", err)
-	}
-
-	var output ValidateAndResolveOutput
-	if err := result.Get(&output); err != nil {
-		t.Fatalf("decode output: %v", err)
-	}
-
-	if len(output.CredentialPaths) != 2 {
-		t.Fatalf("expected 2 credential paths, got %d", len(output.CredentialPaths))
-	}
-	if output.CredentialPaths["agent-vault-aaaaaaaa-1111-2222-3333-444444444444"] != "secret/data/cred-a" {
-		t.Errorf("expected agent-vault-aaaaaaaa-1111-2222-3333-444444444444 → secret/data/cred-a, got %q", output.CredentialPaths["agent-vault-aaaaaaaa-1111-2222-3333-444444444444"])
-	}
-	if output.CredentialPaths["agent-vault-bbbbbbbb-1111-2222-3333-444444444444"] != "secret/data/cred-b" {
-		t.Errorf("expected agent-vault-bbbbbbbb-1111-2222-3333-444444444444 → secret/data/cred-b, got %q", output.CredentialPaths["agent-vault-bbbbbbbb-1111-2222-3333-444444444444"])
-	}
-}
-
-func TestValidateAndResolve_EmptyInput(t *testing.T) {
-	acts := &Activities{}
-
-	testSuite := &testsuite.WorkflowTestSuite{}
-	env := testSuite.NewTestActivityEnvironment()
-	env.RegisterActivity(acts.ValidateAndResolve)
-
-	result, err := env.ExecuteActivity(acts.ValidateAndResolve, ValidateAndResolveInput{
-		AgentID:           "agent-1",
-		TargetDomain:      "example.com",
-		PlaceholderHashes: []string{},
-	})
-	if err != nil {
-		t.Fatalf("ValidateAndResolve error: %v", err)
-	}
-
-	var output ValidateAndResolveOutput
-	if err := result.Get(&output); err != nil {
-		t.Fatalf("decode output: %v", err)
-	}
-
-	if len(output.CredentialPaths) != 0 {
-		t.Errorf("expected 0 credential paths for empty input, got %d", len(output.CredentialPaths))
-	}
-}
-
-func TestValidateAndResolve_PolicyDenied(t *testing.T) {
-	cfg := testConfig(t)
-	eval := &mockEvaluator{
-		result: &authz.AuthzResult{Allowed: false, Reason: "agent not authorized for this domain"},
-	}
-
-	acts := &Activities{
-		Config:    cfg,
-		Evaluator: eval,
-	}
-
-	testSuite := &testsuite.WorkflowTestSuite{}
-	env := testSuite.NewTestActivityEnvironment()
-	env.RegisterActivity(acts.ValidateAndResolve)
-
-	_, err := env.ExecuteActivity(acts.ValidateAndResolve, ValidateAndResolveInput{
-		AgentID:           "agent-1",
-		TargetDomain:      "api.example.com",
-		PlaceholderHashes: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444"},
+	_, err := env.ExecuteActivity(acts.FetchAndInject, FetchInjectInput{
+		RequestID:    "gone-already",
+		Placeholders: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444"},
 	})
 	if err == nil {
-		t.Fatal("expected error from policy denial, got nil")
+		t.Fatal("expected error for missing registry entry, got nil")
 	}
-	if !strings.Contains(err.Error(), "access denied") {
-		t.Errorf("expected error to mention 'access denied', got: %v", err)
-	}
-	if !strings.Contains(err.Error(), "agent not authorized") {
-		t.Errorf("expected error to mention deny reason, got: %v", err)
+	if !strings.Contains(err.Error(), "not found in registry") {
+		t.Errorf("error = %v, want to contain 'not found in registry'", err)
 	}
 }
 
-func TestValidateAndResolve_UnknownPlaceholder(t *testing.T) {
-	cfg := testConfig(t)
-	eval := &mockEvaluator{
-		result: &authz.AuthzResult{Allowed: true},
+// ---------------------------------------------------------------------------
+// SendDecision tests
+// ---------------------------------------------------------------------------
+
+func TestSendDecision_Denied(t *testing.T) {
+	req, _ := http.NewRequest("GET", "https://api.example.com/", nil)
+	decisionCh := make(chan *WorkflowDecision, 1)
+	reqCtx := &RequestContext{
+		Request:     req,
+		ScrubMap:    make(map[string]string),
+		DecisionCh:  decisionCh,
+		ReplaceFunc: func(_ map[string]string) error { return nil },
 	}
 
-	acts := &Activities{
-		Config:    cfg,
-		Evaluator: eval,
-	}
+	reg := &mockRegistry{entries: map[string]*RequestContext{"req-deny": reqCtx}}
+	acts := &Activities{Registry: reg}
 
-	testSuite := &testsuite.WorkflowTestSuite{}
-	env := testSuite.NewTestActivityEnvironment()
-	env.RegisterActivity(acts.ValidateAndResolve)
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.SendDecision)
 
-	_, err := env.ExecuteActivity(acts.ValidateAndResolve, ValidateAndResolveInput{
-		AgentID:           "agent-1",
-		TargetDomain:      "api.example.com",
-		PlaceholderHashes: []string{"hash-nonexistent"},
+	_, err := env.ExecuteActivity(acts.SendDecision, SendDecisionInput{
+		RequestID: "req-deny",
+		Status:    DecisionDenied,
+		Reason:    ReasonAuthorizationDenied,
 	})
-	if err == nil {
-		t.Fatal("expected error for unknown placeholder, got nil")
+	if err != nil {
+		t.Fatalf("SendDecision error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unknown placeholder") {
-		t.Errorf("expected error to mention 'unknown placeholder', got: %v", err)
+
+	select {
+	case decision := <-decisionCh:
+		if decision.Status != DecisionDenied {
+			t.Errorf("decision.Status = %v, want %v", decision.Status, DecisionDenied)
+		}
+		if decision.Reason != ReasonAuthorizationDenied {
+			t.Errorf("decision.Reason = %v, want %v", decision.Reason, ReasonAuthorizationDenied)
+		}
+		if decision.HTTPStatus != ReasonAuthorizationDenied.HTTPStatusCode() {
+			t.Errorf("decision.HTTPStatus = %d, want %d", decision.HTTPStatus, ReasonAuthorizationDenied.HTTPStatusCode())
+		}
+	default:
+		t.Error("expected decision on DecisionCh, got none")
+	}
+}
+
+func TestSendDecision_RegistryMiss(t *testing.T) {
+	reg := &mockRegistry{entries: map[string]*RequestContext{}}
+	acts := &Activities{Registry: reg}
+
+	ts := &testsuite.WorkflowTestSuite{}
+	env := ts.NewTestActivityEnvironment()
+	env.RegisterActivity(acts.SendDecision)
+
+	// Should return nil (no-op) when registry entry is gone.
+	_, err := env.ExecuteActivity(acts.SendDecision, SendDecisionInput{
+		RequestID: "already-gone",
+		Status:    DecisionDenied,
+		Reason:    ReasonAuthorizationDenied,
+	})
+	if err != nil {
+		t.Errorf("SendDecision with missing registry entry should return nil, got: %v", err)
 	}
 }

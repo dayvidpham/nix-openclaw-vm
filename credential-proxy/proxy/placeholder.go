@@ -12,6 +12,11 @@ import (
 // placeholderPattern matches agent-vault placeholder tokens (UUID v4 format).
 var placeholderPattern = regexp.MustCompile(`agent-vault-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`)
 
+// MaxBodyBytes is the maximum bytes read from a request or response body.
+// Gateway initialization should set this from Config.MaxBodySize. The default
+// (10 MiB) applies when the proxy package is used without explicit configuration.
+var MaxBodyBytes int64 = 10 * 1024 * 1024
+
 // Extract finds all unique placeholder tokens in the request's headers, query
 // parameters, and body. The returned slice contains no duplicates.
 func Extract(req *http.Request) ([]string, error) {
@@ -35,10 +40,10 @@ func Extract(req *http.Request) ([]string, error) {
 		}
 	}
 
-	// Scan body (if present). We read the entire body, scan it, then reset it
+	// Scan body (if present). We read up to MaxBodyBytes, scan it, then reset it
 	// so downstream consumers can still read it.
 	if req.Body != nil && req.Body != http.NoBody {
-		body, err := io.ReadAll(req.Body)
+		body, err := io.ReadAll(io.LimitReader(req.Body, MaxBodyBytes))
 		if err != nil {
 			return nil, err
 		}

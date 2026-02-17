@@ -8,6 +8,7 @@
 # - Guest VM connects to credproxy via VSOCK
 # - MITM CA key+cert generated at service activation time (never in /nix/store)
 { config
+, options
 , pkgs
 , lib ? pkgs.lib
 , credential-proxy
@@ -16,15 +17,28 @@
 let
   cfg = config.CUSTOM.virtualisation.openclaw-vm.credentialProxy;
 
+  hasMicrovm = options ? microvm;
+
   inherit (lib)
     mkIf
     mkMerge
     mkOption
     mkEnableOption
+    optionalAttrs
     types
     ;
 
   credproxy-pkg = credential-proxy.packages.${pkgs.system}.credential-proxy;
+
+  # Credentials that carry an env_var field — these are exposed to the guest
+  # via fw_cfg so the guest can populate placeholder env vars at boot.
+  credentialsWithEnvVar = builtins.filter (c: c ? env_var) cfg.credentials;
+
+  # JSON credential file passed to the guest VM via fw_cfg.
+  # Contains only the fields needed by the guest: env_var, placeholder, alias, bound_domain.
+  # The full credential definition (vault_path, header, etc.) stays host-side only.
+  credentialPlaceholdersJson = pkgs.writeText "credproxy-placeholder-env.json"
+    (builtins.toJSON { placeholders = credentialsWithEnvVar; });
 
   caDir = "/var/lib/credproxy/ca";
   caKeyPath = "${caDir}/ca.key";
@@ -122,6 +136,17 @@ in
   };
 
   config = mkIf cfg.enable (mkMerge [
+    # fw_cfg: pass placeholder config to guest VM when microvm is available.
+    # The guest reads this credential at boot via credproxy-placeholder-env.service
+    # and writes /run/credproxy/placeholder.env, making fw_cfg the single source
+    # of truth for which credential placeholders exist and which env var each maps to.
+    (optionalAttrs hasMicrovm {
+      microvm.vms.openclaw-vm.config = {
+        microvm.credentialFiles."credproxy-placeholder-env" = credentialPlaceholdersJson;
+        CUSTOM.virtualisation.openclaw-vm.guest.credentialProxy.fwCfg.enable = true;
+      };
+    })
+
     {
       # Static system user for credproxy — needs VSOCK device access
       users.users.credproxy = {

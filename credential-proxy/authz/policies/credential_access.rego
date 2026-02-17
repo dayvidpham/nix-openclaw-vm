@@ -13,8 +13,9 @@ allow if {
 }
 
 # True when the identity carries a non-empty roles list.
+# Keycloak JWTs carry roles at realm_access.roles, not at the top level.
 has_roles if {
-	roles := input.identity.roles
+	roles := input.identity.realm_access.roles
 	count(roles) > 0
 }
 

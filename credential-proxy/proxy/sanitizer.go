@@ -29,11 +29,11 @@ func ScrubCredentials(resp *http.Response, credentials map[string]string) error 
 	}
 	r := strings.NewReplacer(pairs...)
 
-	// Read the entire response body.
+	// Read up to MaxBodyBytes from the response body.
 	if resp.Body == nil {
 		return nil
 	}
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxBodyBytes))
 	if err != nil {
 		return err
 	}

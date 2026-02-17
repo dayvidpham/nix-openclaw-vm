@@ -15,6 +15,11 @@
         version = "0.1.0";
         src = ./.;
         vendorHash = null;
+
+        postInstall = ''
+          mkdir -p $out/share/policies
+          cp authz/policies/*.rego $out/share/policies/
+        '';
       };
       default = self.packages.${system}.credential-proxy;
     };
