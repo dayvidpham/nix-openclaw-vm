@@ -1,5 +1,5 @@
 # ast-grep project configuration for credential-proxy.
-# Run: ast-grep scan --config sgconfig.yml
-# Or:  ast-grep scan -r rules/no-signal-string-literal.yml .
+# Run from the repo root: ast-grep scan --config credential-proxy/sgconfig.yml credential-proxy/
+# Or from credential-proxy/: ast-grep scan --config sgconfig.yml .
 ruleDirs:
   - rules

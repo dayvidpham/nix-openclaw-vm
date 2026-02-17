@@ -1,4 +1,4 @@
-id: no-signal-string-literal
+id: no-bare-signal-literals
 language: Go
 severity: error
 message: >

@@ -1,4 +1,4 @@
-id: no-stringly-typed-status-enum
+id: no-string-status-types
 language: Go
 severity: warning
 message: >
