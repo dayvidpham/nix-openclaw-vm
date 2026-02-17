@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -106,6 +107,15 @@ type Config struct {
 	// Prevents OOM on large or malicious payloads. Defaults to 10 MiB when zero.
 	MaxBodySize int64 `yaml:"max_body_size"`
 
+	// RegistryTTLSecs is the maximum lifetime (in seconds) of a RequestRegistry
+	// entry before the background sweeper evicts it.
+	// Defaults to 120 when zero (2× the 60-second workflow signal timeout).
+	RegistryTTLSecs int `yaml:"registry_ttl_secs"`
+
+	// ConnTokenTTLSecs is the maximum lifetime (in seconds) of a JWT stored in
+	// connTokens after a CONNECT handshake. Defaults to 120 when zero.
+	ConnTokenTTLSecs int `yaml:"conn_token_ttl_secs"`
+
 	// Index built at load time: placeholder string → Credential
 	credentialIndex map[string]*Credential
 	// Index built at load time: domain → allowed
@@ -151,6 +161,12 @@ const defaultMaxBodySize int64 = 10 * 1024 * 1024
 func (c *Config) Validate() error {
 	if c.MaxBodySize == 0 {
 		c.MaxBodySize = defaultMaxBodySize
+	}
+	if c.RegistryTTLSecs == 0 {
+		c.RegistryTTLSecs = 120
+	}
+	if c.ConnTokenTTLSecs == 0 {
+		c.ConnTokenTTLSecs = 120
 	}
 	if c.OIDC.IssuerURL == "" {
 		return fmt.Errorf("config: oidc.issuer_url is required")
@@ -200,4 +216,14 @@ func (c *Config) LookupCredential(placeholder string) *Credential {
 // IsAllowedDomain checks if a domain is in the allowlist (case-insensitive, fail-closed).
 func (c *Config) IsAllowedDomain(domain string) bool {
 	return c.domainIndex[strings.ToLower(domain)]
+}
+
+// RegistryTTL returns the maximum lifetime of a RequestRegistry entry as a Duration.
+func (c *Config) RegistryTTL() time.Duration {
+	return time.Duration(c.RegistryTTLSecs) * time.Second
+}
+
+// ConnTokenTTL returns the maximum lifetime of a connTokens JWT entry as a Duration.
+func (c *Config) ConnTokenTTL() time.Duration {
+	return time.Duration(c.ConnTokenTTLSecs) * time.Second
 }

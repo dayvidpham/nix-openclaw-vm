@@ -91,14 +91,16 @@ This runs `checks.x86_64-linux.eval-test-vm`, which builds `nixosConfigurations.
 **credential-proxy Go tests** — run from the subdirectory:
 ```bash
 cd credential-proxy
-go test ./...
+go test -race ./...
 ```
 
 Run a single package or test:
 ```bash
-go test ./proxy/ -run TestGateway_PlaceholderSubstitution -v
-go test ./authz/ -v
+go test -race ./proxy/ -run TestGateway_PlaceholderSubstitution -v
+go test -race ./authz/ -v
 ```
+
+The `-race` flag is mandatory for all test runs. It enables the Go data race detector and is also set in the Nix `checkPhase` so Nix builds reproduce the same check.
 
 **Dev shell** — provides Go toolchain, gopls, staticcheck, delve, temporal-cli:
 ```bash

@@ -43,12 +43,15 @@ func (s ProxyStatus) String() string {
 
 // ProxyInput is the serializable input to ProxyRequestWorkflow.
 // It intentionally contains only metadata — never real secret values.
-// The raw JWT is included because ValidateIdentity needs it for JWKS verification.
+// JWT validation and identity extraction are performed by the proxy layer
+// (goproxy OnRequest) before the workflow starts, so raw tokens never appear
+// in Temporal event history. Only the extracted, public-safe IdentityClaims
+// are included here.
 type ProxyInput struct {
-	RequestID    string   `json:"request_id"`
-	RawJWT       string   `json:"raw_jwt"`
-	Placeholders []string `json:"placeholders"`
-	TargetDomain string   `json:"target_domain"`
+	RequestID    string         `json:"request_id"`
+	Claims       IdentityClaims `json:"claims"`
+	Placeholders []string       `json:"placeholders"`
+	TargetDomain string         `json:"target_domain"`
 }
 
 // ResponseCompleteMeta is the payload of the SignalResponseComplete signal sent
@@ -69,30 +72,32 @@ type ProxyOutput struct {
 
 // ProxyRequestWorkflow orchestrates a single proxied request as a full lifecycle:
 //
-//  1. ValidateIdentity — verifies the JWT against Keycloak JWKS (regular activity,
-//     benefits from Temporal retry on transient JWKS network errors).
-//  2. EvaluatePolicy — runs the OPA authorization policy in-process (local activity,
-//     no network needed).
-//  3. FetchAndInject — fetches credentials from OpenBao, replaces placeholder strings
+//  1. EvaluatePolicy — runs the OPA authorization policy in-process (local activity,
+//     no network needed). JWT validation already occurred in the proxy layer.
+//  2. FetchAndInject — fetches credentials from OpenBao, replaces placeholder strings
 //     in the *http.Request in-place via RequestRegistry, and unblocks the goproxy
 //     handler (local activity — secrets never enter Temporal event history).
-//  4. Waits for a SignalResponseComplete signal from goproxy after the upstream
+//  3. Waits for a SignalResponseComplete signal from goproxy after the upstream
 //     response is scrubbed, completing the audit trail.
 //
+// JWT validation is performed by the proxy layer (goproxy OnRequest) before the
+// workflow is started, keeping raw tokens out of Temporal event history entirely.
 // Secret values NEVER appear in Temporal event history. FetchAndInject is a local
 // activity that accesses *http.Request via the in-process RequestRegistry.
 func ProxyRequestWorkflow(ctx workflow.Context, input ProxyInput) (*ProxyOutput, error) {
 	start := workflow.Now(ctx)
 
 	// Set initial search attributes for observability.
+	// Agent identity is available immediately since JWT validation occurred
+	// in the proxy layer before the workflow started.
 	credRefs := strings.Join(input.Placeholders, ",")
-	sa := audit.NewSearchAttributes("", input.TargetDomain, credRefs, StatusInProgress.String())
+	sa := audit.NewSearchAttributes(input.Claims.Subject, input.TargetDomain, credRefs, StatusInProgress.String())
 	if err := workflow.UpsertTypedSearchAttributes(ctx, sa.ToSearchAttributeUpdates()...); err != nil {
 		return nil, err
 	}
 
 	// sendDenial unblocks goproxy with a denied decision on the error paths
-	// of ValidateIdentity and EvaluatePolicy.
+	// of EvaluatePolicy.
 	localDenyCtx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{
 		StartToCloseTimeout: 5 * time.Second,
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
@@ -106,26 +111,10 @@ func ProxyRequestWorkflow(ctx workflow.Context, input ProxyInput) (*ProxyOutput,
 	}
 
 	// -------------------------------------------------------------------------
-	// Step 1: ValidateIdentity (regular activity — JWKS fetch needs network)
-	// -------------------------------------------------------------------------
-	validateCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout: 10 * time.Second,
-		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 2},
-	})
-	var identity IdentityClaims
-	if err := workflow.ExecuteActivity(validateCtx, (*Activities).ValidateIdentity, ValidateIdentityInput{
-		RawJWT: input.RawJWT,
-	}).Get(ctx, &identity); err != nil {
-		sendDenial(ReasonAuthenticationFailed)
-		return finalize(ctx, start, StatusDenied, ResponseCompleteMeta{}, err)
-	}
-
-	// Update search attributes with agent ID now that we have it.
-	sa2 := audit.NewSearchAttributes(identity.Subject, "", "", "")
-	_ = workflow.UpsertTypedSearchAttributes(ctx, sa2.ToSearchAttributeUpdates()...)
-
-	// -------------------------------------------------------------------------
-	// Step 2: EvaluatePolicy (local activity — OPA runs in-process)
+	// Step 1: EvaluatePolicy (local activity — OPA runs in-process)
+	//
+	// JWT validation and identity extraction happened in the proxy layer before
+	// the workflow started. Claims are passed directly in ProxyInput.
 	// -------------------------------------------------------------------------
 	evalCtx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{
 		StartToCloseTimeout: 5 * time.Second,
@@ -133,7 +122,7 @@ func ProxyRequestWorkflow(ctx workflow.Context, input ProxyInput) (*ProxyOutput,
 	})
 	var decision AuthzDecision
 	if err := workflow.ExecuteLocalActivity(evalCtx, (*Activities).EvaluatePolicy, EvalPolicyInput{
-		Claims:       identity,
+		Claims:       input.Claims,
 		Placeholders: input.Placeholders,
 		TargetDomain: input.TargetDomain,
 	}).Get(ctx, &decision); err != nil {
@@ -146,7 +135,7 @@ func ProxyRequestWorkflow(ctx workflow.Context, input ProxyInput) (*ProxyOutput,
 	}
 
 	// -------------------------------------------------------------------------
-	// Step 3: FetchAndInject (local activity — vault fetch + in-place injection)
+	// Step 2: FetchAndInject (local activity — vault fetch + in-place injection)
 	//
 	// FetchAndInject accesses *http.Request via the in-process RequestRegistry.
 	// It ALWAYS sends on DecisionCh before returning (even on error), so goproxy
@@ -168,7 +157,7 @@ func ProxyRequestWorkflow(ctx workflow.Context, input ProxyInput) (*ProxyOutput,
 	}
 
 	// -------------------------------------------------------------------------
-	// Step 4: Wait for SignalResponseComplete from goproxy OnResponse.
+	// Step 3: Wait for SignalResponseComplete from goproxy OnResponse.
 	//
 	// The workflow stays alive while goproxy forwards the modified request and
 	// receives the upstream response. goproxy scrubs the response and signals

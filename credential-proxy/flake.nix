@@ -14,7 +14,13 @@
         pname = "credential-proxy";
         version = "0.1.0";
         src = ./.;
-        vendorHash = "sha256-eyypmSKcmsxFtMryc4TBK2SnXCVYTTld5Cwyi2PoRs8=";
+        vendorHash = "sha256-sIYDpAEx5bMQ+Cu5u1NQHL3l44h1eS4W6AkW6KxI3Uo=";
+
+        checkPhase = ''
+          runHook preCheck
+          go test -race ./...
+          runHook postCheck
+        '';
 
         postInstall = ''
           mkdir -p $out/share/policies
@@ -33,6 +39,7 @@
         go-tools      # staticcheck
         delve         # debugger
         temporal-cli  # Temporal dev server
+        tlaplus18     # TLC model checker (tlc), PlusCal translator (pcal)
       ];
     };
   };

@@ -56,7 +56,9 @@ func (gw *Gateway) handleConnect(host string, ctx *goproxy.ProxyCtx) (*goproxy.C
 
 	// Extract JWT from Proxy-Authorization header and store it for handleRequest.
 	// An empty token is allowed here — handleRequest enforces the presence check.
-	gw.connTokens.Store(ctx.Req.RemoteAddr, extractBearerToken(ctx.Req.Header.Get("Proxy-Authorization")))
+	// storeConnToken also arms a TTL timer that evicts the entry if the client
+	// disconnects before any request arrives (preventing connTokens leaks).
+	gw.storeConnToken(ctx.Req.RemoteAddr, extractBearerToken(ctx.Req.Header.Get("Proxy-Authorization")))
 
 	return goproxy.MitmConnect, host
 }
@@ -64,20 +66,32 @@ func (gw *Gateway) handleConnect(host string, ctx *goproxy.ProxyCtx) (*goproxy.C
 // handleRequest is the OnRequest handler. It:
 //  1. Retrieves the JWT (from connTokens for CONNECT-tunneled requests, or
 //     from Proxy-Authorization for plain HTTP proxy requests).
-//  2. Extracts placeholder strings from the request.
-//  3. If placeholders are found: registers a RequestContext in the registry,
+//  2. Validates the JWT inline via the Verifier — unauthenticated requests are
+//     rejected immediately without starting a Temporal workflow.
+//  3. Extracts placeholder strings from the request.
+//  4. If placeholders are found: registers a RequestContext in the registry,
 //     starts a ProxyRequestWorkflow, and blocks on the decision channel until
 //     FetchAndInject (or SendDecision on error paths) sends the outcome.
-//  4. On an "allowed" decision, the request was already modified in-place by
+//  5. On an "allowed" decision, the request was already modified in-place by
 //     FetchAndInject. Stores the scrub map and workflow IDs in ctx.UserData.
 //
-// Authentication, authorization, and vault access are all performed inside
-// Temporal activities — never inline here.
+// Authorization and vault access are performed inside Temporal activities.
+// Raw tokens never appear in Temporal event history — only the public-safe
+// IdentityClaims extracted from the verified JWT are passed to the workflow.
 func (gw *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 	// Retrieve JWT: check connTokens first (CONNECT tunnel), then Proxy-Authorization.
 	rawToken := gw.resolveToken(req)
 	if rawToken == "" {
 		return req, errorResponse(req, http.StatusProxyAuthRequired, "missing authentication token")
+	}
+
+	// Validate the JWT inline before starting any Temporal workflow.
+	// Rejecting unauthenticated requests here avoids wasting workflow slots and
+	// ensures raw tokens never flow into Temporal event history.
+	identity, err := gw.verifier.VerifyToken(req.Context(), rawToken)
+	if err != nil {
+		slog.Warn("JWT validation failed", "error", err)
+		return req, errorResponse(req, http.StatusProxyAuthRequired, "authentication failed: "+err.Error())
 	}
 
 	// Strip Proxy-Authorization so it is not forwarded upstream.
@@ -123,8 +137,13 @@ func (gw *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*htt
 		ID:        fmt.Sprintf("proxy-%s-%s", targetDomain, requestID),
 		TaskQueue: gw.cfg.Temporal.TaskQueue,
 	}, workflows.ProxyRequestWorkflow, workflows.ProxyInput{
-		RequestID:    requestID,
-		RawJWT:       rawToken,
+		RequestID: requestID,
+		Claims: workflows.IdentityClaims{
+			Subject:   identity.Subject,
+			Roles:     identity.Roles,
+			Groups:    identity.Groups,
+			RawClaims: identity.RawClaims,
+		},
 		Placeholders: placeholders,
 		TargetDomain: targetDomain,
 	})
@@ -167,9 +186,10 @@ func (gw *Gateway) handleRequest(req *http.Request, ctx *goproxy.ProxyCtx) (*htt
 //     values from the response body, then signals the Temporal workflow with
 //     "response_complete" to complete the audit trail.
 func (gw *Gateway) handleResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-	// Clean up the JWT token stored during CONNECT to prevent memory leaks.
+	// Clean up the JWT token stored during CONNECT. deleteConnToken also stops
+	// the TTL timer that was armed by storeConnToken, preventing a double-delete.
 	if ctx.Req != nil {
-		gw.connTokens.Delete(ctx.Req.RemoteAddr)
+		gw.deleteConnToken(ctx.Req.RemoteAddr)
 	}
 
 	if resp == nil {
@@ -212,10 +232,8 @@ func (gw *Gateway) handleResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *h
 // cache first (for CONNECT-tunneled requests), then falls back to the
 // Proxy-Authorization header on the request itself (for plain HTTP proxying).
 func (gw *Gateway) resolveToken(req *http.Request) string {
-	if v, ok := gw.connTokens.Load(req.RemoteAddr); ok {
-		if token, ok := v.(string); ok && token != "" {
-			return token
-		}
+	if token, ok := gw.loadConnToken(req.RemoteAddr); ok {
+		return token
 	}
 	return extractBearerToken(req.Header.Get("Proxy-Authorization"))
 }

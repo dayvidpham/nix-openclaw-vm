@@ -25,7 +25,9 @@ import (
 
 	temporalclient "go.temporal.io/sdk/client"
 
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/authn"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/config"
+	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/internal/testutil"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/vault"
 	"github.com/dayvidpham/nix-openclaw-vm/credential-proxy/workflows"
 )
@@ -253,6 +255,15 @@ func defaultMockStore() *mockStore {
 	}
 }
 
+// defaultMockVerifier returns a verifier that always succeeds with a basic agent identity.
+// Use this for tests that only care about the credential injection path, not auth.
+func defaultMockVerifier() *testutil.MockVerifier {
+	return testutil.DefaultVerifier()
+}
+
+// Compile-time check: testutil.MockVerifier implements authn.Verifier.
+var _ authn.Verifier = (*testutil.MockVerifier)(nil)
+
 // mockStore implements vault.SecretStore.
 type mockStore struct {
 	credentials map[string]*vault.CredentialValue
@@ -287,10 +298,10 @@ func newSimulatedWorker(cfg *config.Config, store vault.SecretStore, override *w
 // startGateway creates a Gateway backed by the given simulatedWorker, starts
 // serving on a random port, and returns the listener address. The listener is
 // closed via t.Cleanup.
-func startGateway(t *testing.T, cfg *config.Config, worker *simulatedWorker, reg *RequestRegistry) string {
+func startGateway(t *testing.T, cfg *config.Config, worker *simulatedWorker, reg *RequestRegistry, verifier authn.Verifier) string {
 	t.Helper()
 
-	gw, err := NewGateway(cfg, worker, reg)
+	gw, err := NewGateway(cfg, worker, reg, verifier)
 	if err != nil {
 		t.Fatalf("NewGateway: %v", err)
 	}
@@ -337,7 +348,7 @@ func TestGateway_PlaceholderSubstitution(t *testing.T) {
 	defer upstream.Close()
 
 	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
-	addr := startGateway(t, cfg, worker, reg)
+	addr := startGateway(t, cfg, worker, reg, defaultMockVerifier())
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", upstream.URL+"/v1/chat", nil)
@@ -372,7 +383,7 @@ func TestGateway_DomainReject(t *testing.T) {
 	cfg := testConfig(t, certPath, keyPath)
 
 	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
-	addr := startGateway(t, cfg, worker, reg)
+	addr := startGateway(t, cfg, worker, reg, defaultMockVerifier())
 
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
@@ -407,7 +418,7 @@ func TestGateway_AuthReject(t *testing.T) {
 	cfg := testConfig(t, certPath, keyPath)
 
 	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
-	addr := startGateway(t, cfg, worker, reg)
+	addr := startGateway(t, cfg, worker, reg, defaultMockVerifier())
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", "http://127.0.0.1/api", nil)
@@ -443,7 +454,7 @@ func TestGateway_WorkflowDeny(t *testing.T) {
 	}
 
 	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), denyDecision)
-	addr := startGateway(t, cfg, worker, reg)
+	addr := startGateway(t, cfg, worker, reg, defaultMockVerifier())
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", "http://127.0.0.1/api", nil)
@@ -485,7 +496,7 @@ func TestGateway_ResponseScrubbing(t *testing.T) {
 	defer upstream.Close()
 
 	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
-	addr := startGateway(t, cfg, worker, reg)
+	addr := startGateway(t, cfg, worker, reg, defaultMockVerifier())
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", upstream.URL+"/api", nil)
@@ -531,7 +542,7 @@ func TestGateway_NoPlaceholderPassthrough(t *testing.T) {
 	defer upstream.Close()
 
 	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
-	addr := startGateway(t, cfg, worker, reg)
+	addr := startGateway(t, cfg, worker, reg, defaultMockVerifier())
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", upstream.URL+"/health", nil)
@@ -570,7 +581,7 @@ func TestGateway_UnknownPlaceholder(t *testing.T) {
 	unknownPH := "agent-vault-99999999-0000-1111-2222-333333333333"
 
 	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
-	addr := startGateway(t, cfg, worker, reg)
+	addr := startGateway(t, cfg, worker, reg, defaultMockVerifier())
 	client := gwProxyClient(t, addr)
 
 	req, err := http.NewRequest("GET", "http://127.0.0.1/api", nil)
@@ -647,7 +658,7 @@ func TestGateway_ConnectHTTPS(t *testing.T) {
 	defer upstream.Close()
 
 	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
-	addr := startGateway(t, cfg, worker, reg)
+	addr := startGateway(t, cfg, worker, reg, defaultMockVerifier())
 	client := gwProxyClientTLS(t, addr, certPath)
 
 	req, err := http.NewRequest("GET", upstream.URL+"/v1/chat", nil)
@@ -672,5 +683,40 @@ func TestGateway_ConnectHTTPS(t *testing.T) {
 	got := <-receivedKey
 	if got != gwRealSecret {
 		t.Errorf("upstream received key = %q, want %q", got, gwRealSecret)
+	}
+}
+
+// TestGateway_InvalidToken verifies that a request carrying a present but
+// invalid JWT receives a 407 Proxy Authentication Required response.
+// This is the zyg path: the proxy validates the JWT inline before any workflow.
+func TestGateway_InvalidToken(t *testing.T) {
+	certPath, keyPath := generateTestCA(t)
+	cfg := testConfig(t, certPath, keyPath)
+
+	// Verifier that always rejects tokens.
+	failVerifier := &testutil.MockVerifier{
+		Err: fmt.Errorf("token signature invalid"),
+	}
+
+	worker, reg := newSimulatedWorker(cfg, defaultMockStore(), nil)
+	addr := startGateway(t, cfg, worker, reg, failVerifier)
+	client := gwProxyClient(t, addr)
+
+	req, err := http.NewRequest("GET", "http://127.0.0.1/api", nil)
+	if err != nil {
+		t.Fatalf("create request: %v", err)
+	}
+	req.Header.Set("X-Api-Key", gwPlaceholder)
+	req.Header.Set("Proxy-Authorization", "Bearer invalid-jwt-token")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d, want %d (407); body = %q", resp.StatusCode, http.StatusProxyAuthRequired, body)
 	}
 }

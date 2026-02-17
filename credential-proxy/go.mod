@@ -8,7 +8,9 @@ require (
 	github.com/mdlayher/vsock v1.2.1
 	github.com/open-policy-agent/opa v1.13.1
 	github.com/openbao/openbao/api/v2 v2.5.1
+	github.com/stretchr/testify v1.11.1
 	go.temporal.io/sdk v1.40.0
+	go.uber.org/goleak v1.3.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -61,7 +63,6 @@ require (
 	github.com/segmentio/asm v1.2.1 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
-	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/tchap/go-patricia/v2 v2.3.3 // indirect
 	github.com/valyala/fastjson v1.6.7 // indirect
 	github.com/vektah/gqlparser/v2 v2.5.31 // indirect

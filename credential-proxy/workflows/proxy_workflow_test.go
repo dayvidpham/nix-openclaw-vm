@@ -18,10 +18,12 @@ import (
 // ---------------------------------------------------------------------------
 
 // wfTestInput returns a ProxyInput suitable for workflow-level tests.
+// JWT validation occurs in the proxy layer before the workflow starts, so
+// wfTestInput carries pre-validated IdentityClaims rather than a raw token.
 func wfTestInput() ProxyInput {
 	return ProxyInput{
 		RequestID:    "req-wf-test-001",
-		RawJWT:       "test-jwt-token",
+		Claims:       wfTestIdentity(),
 		Placeholders: []string{"agent-vault-aaaaaaaa-1111-2222-3333-444444444444"},
 		TargetDomain: "api.example.com",
 	}
@@ -63,20 +65,13 @@ func sendResponseComplete(env *testsuite.TestWorkflowEnvironment, meta ResponseC
 
 // ---------------------------------------------------------------------------
 // TestProxyRequestWorkflow_HappyPath verifies the full success path:
-// ValidateIdentity → EvaluatePolicy → FetchAndInject → response_complete signal → StatusSuccess
+// EvaluatePolicy → FetchAndInject → response_complete signal → StatusSuccess.
+// JWT validation occurs in the proxy layer before the workflow starts,
+// so ValidateIdentity is not called by the workflow.
 // ---------------------------------------------------------------------------
 func TestProxyRequestWorkflow_HappyPath(t *testing.T) {
 	ts := &testsuite.WorkflowTestSuite{}
 	env, acts := newWorkflowEnv(ts)
-
-	identity := wfTestIdentity()
-
-	env.OnActivity(acts.ValidateIdentity, mock.Anything, mock.Anything).
-		Return(&IdentityClaims{
-			Subject:   identity.Subject,
-			Roles:     identity.Roles,
-			RawClaims: identity.RawClaims,
-		}, nil).Once()
 
 	env.OnActivity(acts.EvaluatePolicy, mock.Anything, mock.Anything).
 		Return(&AuthzDecision{Allowed: true}, nil).Once()
@@ -118,18 +113,22 @@ func TestProxyRequestWorkflow_HappyPath(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// TestProxyRequestWorkflow_AuthFailure verifies that a ValidateIdentity failure
-// causes SendDecision to be called and the workflow to return StatusDenied.
+// TestProxyRequestWorkflow_PolicyError verifies that an EvaluatePolicy activity
+// error (as opposed to an in-band denial) causes SendDecision to be called and
+// the workflow to return StatusDenied.
+//
+// Auth failures are now handled in the proxy layer (before the workflow starts),
+// so the first workflow-level failure that can occur is EvaluatePolicy.
 // ---------------------------------------------------------------------------
-func TestProxyRequestWorkflow_AuthFailure(t *testing.T) {
+func TestProxyRequestWorkflow_PolicyError(t *testing.T) {
 	ts := &testsuite.WorkflowTestSuite{}
 	env, acts := newWorkflowEnv(ts)
 
-	authErr := fmt.Errorf("token signature invalid")
+	policyErr := fmt.Errorf("OPA policy evaluation: connection refused")
 
-	// ValidateIdentity fails — this triggers the sendDenial path.
-	env.OnActivity(acts.ValidateIdentity, mock.Anything, mock.Anything).
-		Return((*IdentityClaims)(nil), temporal.NewApplicationError("token verification failed: token signature invalid", "", authErr)).Once()
+	// EvaluatePolicy fails with a transient error — this triggers the sendDenial path.
+	env.OnActivity(acts.EvaluatePolicy, mock.Anything, mock.Anything).
+		Return((*AuthzDecision)(nil), temporal.NewApplicationError(policyErr.Error(), "", policyErr)).Once()
 
 	// sendDenial calls SendDecision as a local activity — mock it as a no-op.
 	// The registry lookup will miss (RequestID is synthetic), so SendDecision
@@ -145,7 +144,7 @@ func TestProxyRequestWorkflow_AuthFailure(t *testing.T) {
 
 	// Workflow should return an error (denied status means non-nil workflow error).
 	if err := env.GetWorkflowError(); err == nil {
-		t.Error("expected workflow error for auth failure, got nil")
+		t.Error("expected workflow error for policy error, got nil")
 	}
 
 	env.AssertExpectations(t)
@@ -158,15 +157,6 @@ func TestProxyRequestWorkflow_AuthFailure(t *testing.T) {
 func TestProxyRequestWorkflow_AuthzDenial(t *testing.T) {
 	ts := &testsuite.WorkflowTestSuite{}
 	env, acts := newWorkflowEnv(ts)
-
-	identity := wfTestIdentity()
-
-	env.OnActivity(acts.ValidateIdentity, mock.Anything, mock.Anything).
-		Return(&IdentityClaims{
-			Subject:   identity.Subject,
-			Roles:     identity.Roles,
-			RawClaims: identity.RawClaims,
-		}, nil).Once()
 
 	// Policy denies — Allowed: false is NOT an activity error but an in-band denial.
 	env.OnActivity(acts.EvaluatePolicy, mock.Anything, mock.Anything).
@@ -199,15 +189,6 @@ func TestProxyRequestWorkflow_InjectFailure(t *testing.T) {
 	ts := &testsuite.WorkflowTestSuite{}
 	env, acts := newWorkflowEnv(ts)
 
-	identity := wfTestIdentity()
-
-	env.OnActivity(acts.ValidateIdentity, mock.Anything, mock.Anything).
-		Return(&IdentityClaims{
-			Subject:   identity.Subject,
-			Roles:     identity.Roles,
-			RawClaims: identity.RawClaims,
-		}, nil).Once()
-
 	env.OnActivity(acts.EvaluatePolicy, mock.Anything, mock.Anything).
 		Return(&AuthzDecision{Allowed: true}, nil).Once()
 
@@ -237,15 +218,6 @@ func TestProxyRequestWorkflow_InjectFailure(t *testing.T) {
 func TestProxyRequestWorkflow_SignalTimeout(t *testing.T) {
 	ts := &testsuite.WorkflowTestSuite{}
 	env, acts := newWorkflowEnv(ts)
-
-	identity := wfTestIdentity()
-
-	env.OnActivity(acts.ValidateIdentity, mock.Anything, mock.Anything).
-		Return(&IdentityClaims{
-			Subject:   identity.Subject,
-			Roles:     identity.Roles,
-			RawClaims: identity.RawClaims,
-		}, nil).Once()
 
 	env.OnActivity(acts.EvaluatePolicy, mock.Anything, mock.Anything).
 		Return(&AuthzDecision{Allowed: true}, nil).Once()
@@ -278,19 +250,13 @@ func TestProxyRequestWorkflow_SignalTimeout(t *testing.T) {
 //
 // Temporal's test environment does not expose a direct API to read upserted
 // search attributes, so we assert via observable workflow outcomes.
+//
+// Agent identity (subject) is now available from the initial upsert since
+// JWT validation occurs in the proxy layer before the workflow starts.
 // ---------------------------------------------------------------------------
 func TestProxyRequestWorkflow_SearchAttributes(t *testing.T) {
 	ts := &testsuite.WorkflowTestSuite{}
 	env, acts := newWorkflowEnv(ts)
-
-	identity := wfTestIdentity()
-
-	env.OnActivity(acts.ValidateIdentity, mock.Anything, mock.Anything).
-		Return(&IdentityClaims{
-			Subject:   identity.Subject,
-			Roles:     identity.Roles,
-			RawClaims: identity.RawClaims,
-		}, nil).Once()
 
 	env.OnActivity(acts.EvaluatePolicy, mock.Anything, mock.Anything).
 		Return(&AuthzDecision{Allowed: true}, nil).Once()

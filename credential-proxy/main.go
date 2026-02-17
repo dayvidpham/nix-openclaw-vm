@@ -94,7 +94,9 @@ func run(args []string) error {
 
 	// Initialize the proxy gateway. It holds a reference to the registry so that
 	// handleRequest can store RequestContext entries for FetchAndInject to look up.
-	gateway, err := proxy.NewGateway(cfg, tc, registry)
+	// The verifier is passed so the gateway can validate JWTs inline in OnRequest,
+	// before any Temporal workflow is started.
+	gateway, err := proxy.NewGateway(cfg, tc, registry, verifier)
 	if err != nil {
 		return fmt.Errorf("init gateway: %w", err)
 	}

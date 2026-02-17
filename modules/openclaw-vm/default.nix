@@ -579,6 +579,12 @@ in
             ip daddr ${bridgeAddr} udp dport 53 accept
             ip daddr ${bridgeAddr} tcp dport 53 accept
 
+            ${lib.optionalString cfg.tailscale.enable ''
+            # Allow outbound Tailscale/Headscale traffic (SSH, management)
+            # iifname != bridgeName already passes inbound tailscale0 traffic above
+            oifname "tailscale0" accept
+            ''}
+
             # DROP all new outbound connections from the VM
             drop
           }
