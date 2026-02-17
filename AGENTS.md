@@ -19,10 +19,10 @@ Dependencies flow from **leaf work up to the user-facing request**. The leaf tas
 The chain reads left-to-right as "blocked by":
 
 ```
-REQUEST -> URE -> PROPOSAL -> IMPLEMENTATION -> features, slices, plan
+REQUEST -> URE -> PROPOSAL -> IMPL PLAN -> slices -> leaf tasks
 ```
 
-Meaning: REQUEST is blocked by URE, URE is blocked by PROPOSAL, etc.
+Meaning: REQUEST is blocked by URE, URE is blocked by PROPOSAL, PROPOSAL is blocked by the IMPL PLAN (implementation plan), the IMPL PLAN is blocked by each vertical slice, and each slice is blocked by its individual leaf tasks.
 
 ### Correct: `--blocked-by` points at what must finish first
 
@@ -30,8 +30,16 @@ Meaning: REQUEST is blocked by URE, URE is blocked by PROPOSAL, etc.
 # "REQUEST is blocked by URE" — URE must complete before REQUEST can close
 bd dep add request-id --blocked-by ure-id
 
-# "PROPOSAL is blocked by IMPLEMENTATION"
-bd dep add proposal-id --blocked-by impl-id
+# "PROPOSAL is blocked by IMPL PLAN"
+bd dep add proposal-id --blocked-by impl-plan-id
+
+# "IMPL PLAN is blocked by each slice"
+bd dep add impl-plan-id --blocked-by slice-1-id
+bd dep add impl-plan-id --blocked-by slice-2-id
+
+# "slice is blocked by its leaf tasks"
+bd dep add slice-1-id --blocked-by leaf-task-a-id
+bd dep add slice-1-id --blocked-by leaf-task-b-id
 ```
 
 Produces the correct tree (leaf work at the bottom, user request at the top):
@@ -40,10 +48,13 @@ Produces the correct tree (leaf work at the bottom, user request at the top):
 REQUEST
   └── blocked by URE
         └── blocked by PROPOSAL
-              └── blocked by IMPLEMENTATION
-                    ├── blocked by feature-slice-1
-                    ├── blocked by feature-slice-2
-                    └── blocked by impl-plan
+              └── blocked by IMPL PLAN
+                    ├── blocked by slice-1
+                    │     ├── blocked by leaf-task-a
+                    │     └── blocked by leaf-task-b
+                    └── blocked by slice-2
+                          ├── blocked by leaf-task-c
+                          └── blocked by leaf-task-d
 ```
 
 ### Wrong: reversed direction
@@ -54,13 +65,15 @@ REQUEST
 bd dep add ure-id --blocked-by request-id
 ```
 
-Produces a nonsensical tree where implementation must wait for the request to close:
+Produces a nonsensical tree where leaf tasks must wait for the request to close:
 
 ```
-IMPLEMENTATION
-  └── blocked by PROPOSAL
-        └── blocked by URE
-              └── blocked by REQUEST   # backwards — request can't block its own prerequisites
+leaf-task-a
+  └── blocked by slice-1
+        └── blocked by IMPL PLAN
+              └── blocked by PROPOSAL
+                    └── blocked by URE
+                          └── blocked by REQUEST   # backwards
 ```
 
 **Rule of thumb:** The `--blocked-by` target is always the thing you do *first*. Work flows bottom-up; closure flows top-down.
