@@ -319,10 +319,8 @@ in
       # VM uses host as DNS resolver for security (encrypted DNS, logging)
       services.resolved = {
         enable = true;
-        extraConfig = ''
-          # Allow DNS queries from VM network
-          DNSStubListenerExtra=${lib.head (lib.splitString "/" cfg.network.bridgeAddress)}
-        '';
+        settings.Resolve.DNSStubListenerExtra =
+          lib.head (lib.splitString "/" cfg.network.bridgeAddress);
       };
 
       # Allow only DNS from VM to host (not full interface trust)
