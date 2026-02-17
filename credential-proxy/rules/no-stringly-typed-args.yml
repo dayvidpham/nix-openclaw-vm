@@ -2,23 +2,19 @@ id: no-stringly-typed-args
 language: Go
 severity: error
 message: >
-  A string literal is used as a Status, Reason, or Decision field value in a struct
-  literal. Use the typed enum constant instead (e.g., `DecisionDenied`, `ReasonAuthorizationDenied`).
-  String literals at struct field boundaries bypass the type system and allow invalid values.
+  A string literal is used in a WorkflowDecision or SendDecisionInput field that
+  requires a typed enum. Use DecisionStatus for Status and DenialReason for Reason.
+  String literals at these API boundaries bypass the type system.
 note: >
-  Replace `Reason: "..."` with the appropriate DenialReason constant.
-  Replace `Status: "..."` with the appropriate DecisionStatus or ProxyStatus constant.
-  The typed enums are defined in credential-proxy/workflows/activities.go and proxy_workflow.go.
+  WorkflowDecision.Status must be DecisionStatus (DecisionAllowed, DecisionDenied, DecisionError).
+  WorkflowDecision.Reason must be DenialReason (ReasonAuthenticationFailed, ReasonAuthorizationDenied, etc).
+  SendDecisionInput.Status and .Reason have the same constraints.
+  The typed enums are defined in credential-proxy/workflows/activities.go.
 rule:
   any:
-    - all:
-        - pattern: $STRUCT{$$$, Status: "$VAL"}
-        - regex: "Status:\s*\""
-    - all:
-        - pattern: $STRUCT{$$$, Reason: "$VAL"}
-        - regex: "Reason:\s*\""
-    - all:
-        - pattern: $STRUCT{$$$, Decision: "$VAL"}
-        - regex: "Decision:\s*\""
+    - pattern: 'WorkflowDecision{$$$, Status: "$VAL"}'
+    - pattern: 'WorkflowDecision{$$$, Reason: "$VAL"}'
+    - pattern: 'SendDecisionInput{$$$, Status: "$VAL"}'
+    - pattern: 'SendDecisionInput{$$$, Reason: "$VAL"}'
 ignore:
   - "**/vendor/**"

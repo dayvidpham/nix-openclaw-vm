@@ -133,22 +133,24 @@ The `test-vm` config has `dangerousDevMode` enabled and sops/Tailscale/Caddy dis
 - **Use `ast-grep` to audit.** Run the project's rules before submitting changes. Any new string literal in a function signature, struct field type, or channel type is a code smell.
 
   ```bash
-  # Run all three stringly-typed API rules (from credential-proxy/ directory context):
-  ast-grep scan -r credential-proxy/rules/no-signal-string-literal.yml credential-proxy/
-  ast-grep scan -r credential-proxy/rules/no-stringly-typed-status-enum.yml credential-proxy/
-  ast-grep scan -r credential-proxy/rules/no-untyped-string-const.yml credential-proxy/
-
-  # Or run all rules at once via the project config:
+  # Run all rules at once via the project config:
   ast-grep scan --config credential-proxy/sgconfig.yml credential-proxy/
+
+  # Or run individual rules:
+  ast-grep scan -r credential-proxy/rules/no-bare-signal-literals.yml credential-proxy/
+  ast-grep scan -r credential-proxy/rules/no-string-status-types.yml credential-proxy/
+  ast-grep scan -r credential-proxy/rules/no-stringly-typed-args.yml credential-proxy/
+  ast-grep scan -r credential-proxy/rules/no-untyped-string-const.yml credential-proxy/
   ```
 
   | Rule file | Detects | Severity |
   |-----------|---------|----------|
-  | `rules/no-signal-string-literal.yml` | Bare string literals in `GetSignalChannel()` or `SignalWorkflow()` signal-name argument | error |
-  | `rules/no-stringly-typed-status-enum.yml` | `type XStatus string`, `type XDecision string`, `type XReason string` declarations | warning |
+  | `rules/no-bare-signal-literals.yml` | Bare string literals in `GetSignalChannel()` or `SignalWorkflow()` signal-name argument | error |
+  | `rules/no-string-status-types.yml` | `type XStatus string`, `type XDecision string`, `type XReason string` declarations | warning |
+  | `rules/no-stringly-typed-args.yml` | String literals in `WorkflowDecision` or `SendDecisionInput` Status/Reason fields | error |
   | `rules/no-untyped-string-const.yml` | Untyped `const X = "..."` where X contains Status/Reason/Decision/Signal | warning |
 
-  All three rules must produce **zero violations in non-vendor code** before merging.
+  All four rules must produce **zero violations in non-vendor code** before merging.
 
 ### Test writing rules for agents
 
