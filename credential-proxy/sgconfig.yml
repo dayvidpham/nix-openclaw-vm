@@ -1,5 +1,5 @@
 # ast-grep project configuration for credential-proxy.
-# Run from the repo root: ast-grep scan --config credential-proxy/sgconfig.yml credential-proxy/
-# Or from credential-proxy/: ast-grep scan --config sgconfig.yml .
+# Run from credential-proxy/: ast-grep scan --config sgconfig.yml .
+# Or individual rules from repo root: ast-grep scan -r credential-proxy/ast-grep/<rule>.yml credential-proxy/
 ruleDirs:
-  - rules
+  - ast-grep

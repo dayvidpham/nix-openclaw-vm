@@ -133,22 +133,22 @@ The `test-vm` config has `dangerousDevMode` enabled and sops/Tailscale/Caddy dis
 - **Use `ast-grep` to audit.** Run the project's rules before submitting changes. Any new string literal in a function signature, struct field type, or channel type is a code smell.
 
   ```bash
-  # Run all rules at once via the project config:
-  ast-grep scan --config credential-proxy/sgconfig.yml credential-proxy/
+  # Run all rules at once via the project config (from credential-proxy/):
+  cd credential-proxy && ast-grep scan --config sgconfig.yml .
 
-  # Or run individual rules:
-  ast-grep scan -r credential-proxy/rules/no-bare-signal-literals.yml credential-proxy/
-  ast-grep scan -r credential-proxy/rules/no-string-status-types.yml credential-proxy/
-  ast-grep scan -r credential-proxy/rules/no-stringly-typed-args.yml credential-proxy/
-  ast-grep scan -r credential-proxy/rules/no-untyped-string-const.yml credential-proxy/
+  # Or run individual rules from repo root:
+  ast-grep scan -r credential-proxy/ast-grep/no-bare-signal-literals.yml credential-proxy/
+  ast-grep scan -r credential-proxy/ast-grep/no-string-status-types.yml credential-proxy/
+  ast-grep scan -r credential-proxy/ast-grep/no-stringly-typed-args.yml credential-proxy/
+  ast-grep scan -r credential-proxy/ast-grep/no-untyped-string-const.yml credential-proxy/
   ```
 
   | Rule file | Detects | Severity |
   |-----------|---------|----------|
-  | `rules/no-bare-signal-literals.yml` | Bare string literals in `GetSignalChannel()` or `SignalWorkflow()` signal-name argument | error |
-  | `rules/no-string-status-types.yml` | `type XStatus string`, `type XDecision string`, `type XReason string` declarations | warning |
-  | `rules/no-stringly-typed-args.yml` | String literals in `WorkflowDecision` or `SendDecisionInput` Status/Reason fields | error |
-  | `rules/no-untyped-string-const.yml` | Untyped `const X = "..."` where X contains Status/Reason/Decision/Signal | warning |
+  | `ast-grep/no-bare-signal-literals.yml` | Bare string literals in `GetSignalChannel()` or `SignalWorkflow()` signal-name argument | error |
+  | `ast-grep/no-string-status-types.yml` | `type XStatus string`, `type XDecision string`, `type XReason string` declarations | warning |
+  | `ast-grep/no-stringly-typed-args.yml` | String literals in `WorkflowDecision` or `SendDecisionInput` Status/Reason fields | error |
+  | `ast-grep/no-untyped-string-const.yml` | Untyped `const X = "..."` where X contains Status/Reason/Decision/Signal | warning |
 
   All four rules must produce **zero violations in non-vendor code** before merging.
 
