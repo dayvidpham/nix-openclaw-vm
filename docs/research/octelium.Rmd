@@ -1,0 +1,682 @@
+---
+title: "Octelium - Secretless Access Pattern Analysis"
+date: "2026-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+## Executive Summary
+
+This report documents the findings from a comparative study of Octelium's zero-trust secretless access architecture against the credential-proxy project. Octelium is a comprehensive multi-protocol gateway system (24,383 LOC in Vigil alone, 639 Go files total) while credential-proxy is a focused MITM forward proxy (3,123 LOC). The study examined six areas: token rotation, credential injector interfaces, CEL policy evaluation, middleware chain architecture, multi-protocol support, and memory-safe credential storage.
+
+**Key Finding:** Octelium uses a policy-first architecture with statically-typed credential schemes and a CEL/OPA dual-engine approach, while credential-proxy uses a credential-centric, configuration-driven approach with embedded OPA for authorization. Several patterns from Octelium are directly applicable to credential-proxy without requiring the full complexity of the Octelium stack.
+
+---
+
+## Token Rotation
+
+### Octelium: Explicit Rotation API
+
+Octelium manages credential rotation through a dedicated API server endpoint at
+`cluster/apiserver/apiserver/admin/credential.go`. The `GenerateCredentialToken` method
+(lines 137--300) handles three credential types with distinct rotation semantics:
+
+```go
+// credential.go:150-152
+cred.Status.TokenID = vutils.UUIDv4()
+cred.Status.LastRotationAt = pbutils.Now()
+cred.Status.TotalRotations = cred.Status.TotalRotations + 1
+```
+
+Token generation uses a JWK controller (`jwkctl.NewJWKController`) to produce signed tokens.
+The credential spec supports an `ExpiresAt` timestamp validated at creation time:
+
+```go
+// credential.go:322-326
+if req.Spec.ExpiresAt.IsValid() {
+    if time.Now().After(req.Spec.ExpiresAt.AsTime()) {
+        return grpcutils.InvalidArg("Credential expiry time exceeded")
+    }
+}
+```
+
+Three token types are supported via a protobuf `oneof` union:
+
+- `AUTH_TOKEN` -- Raw stateless JWT
+- `OAUTH2` -- Client ID + secret pair for service-to-service communication
+- `ACCESS_TOKEN` -- Session-bound JWT with TTL tied to session lifetime
+
+### Credential-Proxy: Vault-Delegated Rotation
+
+Credential-proxy delegates all rotation and TTL management to the OpenBao vault.
+There is no rotation counter, no expiry tracking, and no cached state in the proxy itself:
+
+```go
+// vault/client.go - Per-request fetch pattern
+credVal, err := gw.vault.FetchCredential(bgCtx, b.VaultPath)
+realValue := credVal.HeaderPrefix + credVal.Key
+replacements[b.Placeholder] = realValue
+```
+
+### Assessment
+
+| Aspect | Octelium | Credential-Proxy |
+|--------|----------|------------------|
+| Rotation trigger | Explicit API call, increments counter | Vault-managed (automatic or on-demand) |
+| State tracking | `TotalRotations`, `LastRotationAt`, `TokenID` | None (stateless proxy) |
+| Expiry enforcement | `ExpiresAt` validated at creation | Vault token TTL only |
+| Caching | SecretManager cache with 10-min flush | No caching (per-request Vault call) |
+
+**Adoption recommendation:** Add optional secret caching with a configurable TTL (5--30 seconds)
+to credential-proxy. The Vault-centric delegation model is sound for the single-proxy use case, but
+per-request Vault RTT introduces unnecessary latency for high-throughput scenarios. Rotation
+tracking counters are not needed given Vault already handles this concern.
+
+---
+
+## Credential Injector Interface
+
+### Octelium: Type-Safe `oneof` Union Pattern
+
+Octelium defines its credential injection schemes using a protobuf `oneof` union type
+(`apis/main/corev1/corev1.pb.go`). Each auth type is a distinct struct, preventing
+type confusion at compile time:
+
+```go
+// corev1.pb.go - Auth type union interface
+type isService_Spec_Config_HTTP_Auth_Type interface {
+    isService_Spec_Config_HTTP_Auth_Type()
+}
+
+type Service_Spec_Config_HTTP_Auth_Bearer_ struct {
+    Bearer *Service_Spec_Config_HTTP_Auth_Bearer `protobuf:"bytes,1,opt,name=bearer,proto3,oneof"`
+}
+type Service_Spec_Config_HTTP_Auth_Basic_ struct {
+    Basic *Service_Spec_Config_HTTP_Auth_Basic `protobuf:"bytes,2,opt,name=basic,proto3,oneof"`
+}
+type Service_Spec_Config_HTTP_Auth_Custom_ struct {
+    Custom *Service_Spec_Config_HTTP_Auth_Custom `protobuf:"bytes,3,opt,name=custom,proto3,oneof"`
+}
+type Service_Spec_Config_HTTP_Auth_Oauth2ClientCredentials struct {
+    Oauth2ClientCredentials *Service_Spec_Config_HTTP_Auth_OAuth2ClientCredentials `protobuf:"bytes,4,opt,name=oauth2ClientCredentials,proto3,oneof"`
+}
+type Service_Spec_Config_HTTP_Auth_Sigv4_ struct {
+    Sigv4 *Service_Spec_Config_HTTP_Auth_Sigv4 `protobuf:"bytes,5,opt,name=sigv4,proto3,oneof"`
+}
+```
+
+The actual injection logic lives in the headers middleware
+(`cluster/vigil/vigil/modes/httpg/middlewares/headers/headers.go:111--158`).
+Each scheme resolves its secret through the SecretManager and constructs the
+appropriate header value:
+
+```go
+// headers.go:115-158 - Auth scheme injection
+if authS.GetBearer() != nil && authS.GetBearer().GetFromSecret() != "" {
+    secret, err := m.secretMan.GetByName(ctx, authS.GetBearer().GetFromSecret())
+    if err == nil {
+        req.Header.Set("Authorization", fmt.Sprintf("Bearer %s",
+            ucorev1.ToSecret(secret).GetValueStr()))
+    }
+} else if authS.GetBasic() != nil {
+    secret, err := m.secretMan.GetByName(ctx, authS.GetBasic().GetPassword().GetFromSecret())
+    if err == nil {
+        authVal := base64.StdEncoding.EncodeToString(
+            []byte(fmt.Sprintf("%s:%s",
+                authS.GetBasic().Username, ucorev1.ToSecret(secret).GetValueStr())))
+        req.Header.Set("Authorization", fmt.Sprintf("Basic %s", authVal))
+    }
+} else if authS.GetOauth2ClientCredentials() != nil {
+    accessToken, err := m.secretMan.GetOAuth2CCToken(ctx, &secretman.GetOAuth2CCTokenReq{
+        ClientID:   authS.GetOauth2ClientCredentials().ClientID,
+        SecretName: authS.GetOauth2ClientCredentials().GetClientSecret().GetFromSecret(),
+        TokenURL:   authS.GetOauth2ClientCredentials().TokenURL,
+    })
+    if err == nil {
+        req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+    }
+}
+```
+
+All secret values are sourced through a `FromSecret` accessor pattern, decoupling the
+injection logic from the storage backend.
+
+### Credential-Proxy: String Enum + Manual Header Binding
+
+Credential-proxy uses a `CredentialType` string enum with manually configured header fields:
+
+```go
+// config/config.go:11-41
+type CredentialType string
+const (
+    CredentialTypeAPIKey    CredentialType = "api_key"
+    CredentialTypeBearer    CredentialType = "bearer"
+    CredentialTypeBasicAuth CredentialType = "basic_auth"
+    CredentialTypeHeader    CredentialType = "header"
+)
+
+type Credential struct {
+    Placeholder  string         `yaml:"placeholder"`
+    Type         CredentialType `yaml:"type"`
+    VaultPath    string         `yaml:"vault_path"`
+    BoundDomain  string         `yaml:"bound_domain"`
+    HeaderName   string         `yaml:"header_name"`
+    HeaderPrefix string         `yaml:"header_prefix"`
+}
+```
+
+### Assessment
+
+| Aspect | Octelium | Credential-Proxy |
+|--------|----------|------------------|
+| Type safety | Compile-time via protobuf `oneof` | Runtime string enum validation |
+| Auth schemes | 5 (Bearer, Basic, Custom, OAuth2 CC, Sigv4) | 4 (API key, Bearer, Basic, Header) |
+| Secret sourcing | `FromSecret` accessor pattern | `VaultPath` direct reference |
+| Header construction | Scheme-specific (automated) | Manual `HeaderName` + `HeaderPrefix` |
+| OAuth2 token exchange | Built-in client credentials flow | Not supported |
+| Error handling | Log and continue (non-fatal) | Not applicable (different model) |
+
+**Adoption recommendation:** Add OAuth2 client credentials flow support using
+`golang.org/x/oauth2/clientcredentials`. Consider moving toward typed auth scheme
+definitions to prevent header misconfiguration, but the current YAML enum approach
+is adequate for the near term. Sigv4 support should be added if AWS API proxying is needed.
+
+---
+
+## CEL Policy Evaluation
+
+### Octelium: Dual-Engine Architecture
+
+Octelium uses a dual-engine policy system with CEL as the primary engine and OPA as a
+fallback. The CEL engine (`cluster/common/celengine/celengine.go`) provides multiple
+typed evaluation methods:
+
+```go
+// celengine.go:37-70
+type CELEngine struct {
+    c         *cache.Cache    // 24h TTL, 10min cleanup
+    env       *cel.Env
+    opaEngine *opaEngine
+}
+
+func New(ctx context.Context, opts *Opts) (*CELEngine, error) {
+    env, err := cel.NewEnv(
+        cel.Declarations(
+            decls.NewVar("ctx", decls.Dyn),
+            decls.NewVar("attrs", decls.Dyn),
+        ),
+        cellib.CELLib(),
+    )
+    // ...
+    opaEngine, err := newOPAEngine(ctx, &opaOpts{})
+    return &CELEngine{
+        c:         cache.New(24*time.Hour, 10*time.Minute),
+        env:       env,
+        opaEngine: opaEngine,
+    }, nil
+}
+```
+
+The engine exposes typed evaluation methods that compile and cache CEL programs:
+
+```go
+func (e *CELEngine) EvalPolicy(ctx context.Context, exp string, input map[string]any) (bool, error)
+func (e *CELEngine) EvalPolicyString(ctx context.Context, exp string, input map[string]any) (string, error)
+func (e *CELEngine) EvalPolicyMapStrAny(ctx context.Context, exp string, input map[string]any) (map[string]any, error)
+func (e *CELEngine) OPAEvalPolicyMapStrAny(ctx context.Context, expr string, input map[string]any) (map[string]any, error)
+```
+
+CEL is used for dynamic header injection via expressions:
+
+```go
+// headers.go:90-101
+case *corev1.Service_Spec_Config_HTTP_Header_KeyValue_Eval:
+    val, _ := m.celEngine.EvalPolicyString(ctx, hdr.GetEval(), inputMap)
+    req.Header.Set(hdr.Key, val)
+```
+
+And for dynamic service config selection:
+
+```go
+// auth.go:236-268
+for _, rule := range svc.Spec.DynamicConfig.Rules {
+    isMatch, err := s.celEngine.EvalCondition(ctx, rule.Condition, inputMap)
+    if isMatch {
+        switch rule.Type.(type) {
+        case *corev1.Service_Spec_DynamicConfig_Rule_ConfigName:
+            // Reference named config
+        case *corev1.Service_Spec_DynamicConfig_Rule_Eval:
+            // Inline CEL expression
+        case *corev1.Service_Spec_DynamicConfig_Rule_Opa:
+            // Inline OPA Rego policy
+        }
+    }
+}
+```
+
+### Credential-Proxy: Single OPA Engine
+
+Credential-proxy uses a focused OPA evaluator with two prepared queries:
+
+```go
+// authz/engine.go:42-86
+type Evaluator interface {
+    Evaluate(ctx context.Context, req *AuthzRequest) (*AuthzResult, error)
+}
+
+type OPAEvaluator struct {
+    allowQuery       rego.PreparedEvalQuery
+    denyReasonsQuery rego.PreparedEvalQuery
+}
+
+// Two queries per evaluation:
+// data.credproxy.authz.allow       -> boolean
+// data.credproxy.authz.deny_reasons -> string set
+```
+
+### Assessment
+
+| Aspect | Octelium | Credential-Proxy |
+|--------|----------|------------------|
+| Engine count | 2 (CEL primary, OPA fallback) | 1 (OPA only) |
+| Policy format | CEL expressions + OPA Rego | OPA Rego only |
+| Program caching | 24h TTL with 10min cleanup | PreparedEvalQuery (setup-time) |
+| Policy reload | Dynamic (cache flush on update) | Static (restart required) |
+| Expression scope | Header values, routing, conditions | Authorization decisions only |
+| Complexity | Higher (two languages) | Lower (single language) |
+
+**Adoption recommendation:** OPA is sufficient for credential-proxy's authorization-only use case.
+CEL should be considered only if dynamic header injection or per-request routing rules are
+needed in the future. Adding CEL introduces a second policy language and increases operator
+cognitive load. The program caching pattern (24h TTL) from Octelium's CEL engine is worth
+adopting for OPA prepared queries if policy hot-reloading is implemented.
+
+---
+
+## Middleware Chain Architecture
+
+### Octelium: 14-Stage HTTP Pipeline
+
+Octelium's HTTP gateway (`cluster/vigil/vigil/modes/httpg/server.go`) composes
+middlewares using standard Go `http.Handler` chaining. The full middleware list discovered
+from the codebase:
+
+| Stage | Middleware | Source File | Purpose |
+|-------|-----------|-------------|---------|
+| 1 | Preauth | `preauth/preauth.go` | Anonymous mode, request context |
+| 2 | Auth | `auth/auth.go` | JWT verification, AuthenticateAndAuthorize RPC |
+| 3 | Cache | `cache/cache.go` | Response caching |
+| 4 | JSON Schema | `jsonchema/jsonschema.go` | Request body validation |
+| 5 | Path | `path/path.go` | Path prefix add/remove |
+| 6 | Headers | `headers/headers.go` | Auth injection, header transform |
+| 7 | Lua | `lua/lua.go` | Custom Lua scripting |
+| 8 | Direct | `direct/direct.go` | Direct response (bypass upstream) |
+| 9 | ExtProc | `extproc/extproc.go` | External processing |
+| 10 | Rate Limit | `ratelimit/ratelimit.go` | Rate limiting |
+| 11 | Compress | `compress/compress.go` | Response compression |
+| 12 | Access Log | `accesslog/accesslog.go` | Audit logging |
+| 13 | Metrics | `metrics/metrics.go` | Prometheus metrics |
+| 14 | Proxy | `proxy.go` | Reverse proxy with RoundTripper |
+
+The credential injection occurs in stage 6 (Headers), while Sigv4 signing occurs in
+stage 14 within the `httputil.ReverseProxy` Director function:
+
+```go
+// proxy.go:232-260
+if httpCfg.GetAuth().GetSigv4() != nil {
+    sigv4Opts := httpCfg.GetAuth().GetSigv4()
+    secret, err := s.secretMan.GetByName(ctx, sigv4Opts.GetSecretAccessKey().GetFromSecret())
+    if err == nil {
+        signer := sigv4.NewSigner()
+        payloadHash := fmt.Sprintf("%x", sha256.Sum256([]byte(reqCtx.Body)))
+        outReq.Header.Set("X-Amz-Content-Sha256", payloadHash)
+        signer.SignHTTP(ctx, aws.Credentials{
+            AccessKeyID:     sigv4Opts.AccessKeyID,
+            SecretAccessKey: ucorev1.ToSecret(secret).GetValueStr(),
+        }, outReq, payloadHash, sigv4Opts.Service, sigv4Opts.Region, time.Now())
+    }
+}
+```
+
+### Credential-Proxy: 5-Stage Pipeline
+
+Credential-proxy's pipeline is tighter and purpose-built for MITM proxying:
+
+| Stage | Handler | Source File | Purpose |
+|-------|---------|-------------|---------|
+| 1 | HandleConnect | `proxy/handlers.go` | Domain allowlist, JWT extraction |
+| 2 | HandleRequest | `proxy/handlers.go` | AuthN/AuthZ, placeholder replacement |
+| 3 | Proxy | goproxy (internal) | MITM TLS, HTTP forwarding |
+| 4 | HandleResponse | `proxy/handlers.go` | Response scrubbing |
+| 5 | Audit | `workflows/` | Temporal workflow (async) |
+
+```
+Client -> CONNECT example.com:443
+  |  handleConnect: allowlist check, JWT extraction, connTokens store
+  v
+  HTTP request with placeholder "agent-vault-xxx"
+  |  handleRequest: JWT verify, placeholder extract, OPA authz,
+  |                 Vault fetch, placeholder -> real value
+  v
+  goproxy: forward to upstream
+  |  handleResponse: scrub real credentials from response body
+  v
+  Response to client (credentials replaced with placeholders)
+  |  async: Temporal audit workflow fires
+```
+
+### Assessment
+
+| Aspect | Octelium | Credential-Proxy |
+|--------|----------|------------------|
+| Stage count | 14 | 5 |
+| Auth injection point | Stage 6 (Headers middleware) | Stage 2 (HandleRequest) |
+| Secret resolution | Cached SecretManager lookup | Per-request Vault call |
+| Response handling | Upstream-managed (trusted) | Regex scrubbing (untrusted) |
+| MITM capability | No (reverse proxy only) | Yes (full MITM via goproxy) |
+| Audit method | Sync access log middleware | Async Temporal workflow |
+
+**Adoption recommendation:** Credential-proxy's focused 5-stage pipeline is appropriate
+for its use case. Do not expand toward Octelium's 14-stage model. If features are added,
+prioritize them within existing stages rather than adding new middleware layers.
+The response scrubbing pattern (absent in Octelium) is a strength of credential-proxy
+for untrusted agent scenarios.
+
+---
+
+## Multi-protocol Support
+
+### Octelium: Protocol-Specific Mode Selection
+
+Octelium's Vigil gateway supports 10 protocol modes selected at server construction
+time via a `modes.Server` interface (`cluster/vigil/vigil/vigil.go:148--194`):
+
+```go
+// vigil.go:165-192
+switch mode {
+case corev1.Service_Spec_SSH:
+    s.server, err = ssh.New(ctx, opts)
+case corev1.Service_Spec_UDP:
+    s.server, err = udp.New(ctx, opts)
+case corev1.Service_Spec_TCP, corev1.Service_Spec_MODE_UNSET:
+    s.server, err = tcp.New(ctx, opts)
+case corev1.Service_Spec_DNS:
+    s.server, err = dns.New(ctx, opts)
+case corev1.Service_Spec_HTTP, corev1.Service_Spec_KUBERNETES,
+     corev1.Service_Spec_GRPC, corev1.Service_Spec_WEB:
+    s.server, err = httpg.New(ctx, opts)
+case corev1.Service_Spec_POSTGRES:
+    s.server, err = postgres.New(ctx, opts)
+case corev1.Service_Spec_MYSQL:
+    s.server, err = mysql.New(ctx, opts)
+}
+```
+
+The supported modes as a protobuf enum:
+
+```go
+// corev1.pb.go:93-119
+const (
+    Service_Spec_MODE_UNSET Service_Spec_Mode = 0
+    Service_Spec_TCP        Service_Spec_Mode = 1
+    Service_Spec_UDP        Service_Spec_Mode = 2
+    Service_Spec_HTTP       Service_Spec_Mode = 3
+    Service_Spec_SSH        Service_Spec_Mode = 4
+    Service_Spec_KUBERNETES Service_Spec_Mode = 5
+    Service_Spec_POSTGRES   Service_Spec_Mode = 6
+    Service_Spec_MYSQL      Service_Spec_Mode = 7
+    Service_Spec_GRPC       Service_Spec_Mode = 8
+    Service_Spec_WEB        Service_Spec_Mode = 9
+    Service_Spec_DNS        Service_Spec_Mode = 10
+)
+```
+
+Each mode has protocol-specific auth handling. For example, the SecretManager tracks
+secrets needed per protocol:
+
+```go
+// secretman.go:148-226
+doSetCfgSecrets := func(cfg *corev1.Service_Spec_Config) {
+    // SSH: password or private key from secret
+    if cfg.GetSsh().Auth.GetPassword().GetFromSecret() != "" {
+        doAppend(cfg.GetSsh().Auth.GetPassword().GetFromSecret())
+    }
+    // Postgres: password from secret
+    if cfg.GetPostgres().Auth.GetPassword().GetFromSecret() != "" {
+        doAppend(cfg.GetPostgres().Auth.GetPassword().GetFromSecret())
+    }
+    // HTTP: Bearer, Basic, Custom, OAuth2 CC, Sigv4
+    if cfg.GetHttp().GetAuth().GetBearer().GetFromSecret() != "" {
+        doAppend(authS.GetBearer().GetFromSecret())
+    }
+    // Kubernetes: bearer token or kubeconfig from secret
+    if k8sC.GetBearerToken().GetFromSecret() != "" {
+        doAppend(k8sC.GetBearerToken().GetFromSecret())
+    }
+}
+```
+
+### Credential-Proxy: HTTP-Only via goproxy
+
+Credential-proxy handles HTTP(S) exclusively through goproxy's MITM proxy,
+operating over VSOCK for VM isolation:
+
+```go
+// gateway.go:21-33
+type Gateway struct {
+    cfg      *config.Config
+    authn    authn.Verifier
+    authz    authz.Evaluator
+    vault    vault.SecretStore
+    proxy    *goproxy.ProxyHttpServer
+    temporal temporalclient.Client
+    connTokens sync.Map
+}
+```
+
+### Assessment
+
+**Adoption recommendation:** Multi-protocol support is over-engineered for credential-proxy's
+use case. The HTTP-only MITM model is the correct architectural choice for an agent credential
+proxy operating over VSOCK. Do not add SSH, TCP, gRPC, or database protocol modes. If database
+credential proxying is needed in the future, it should be a separate purpose-built proxy
+rather than an extension of the HTTP MITM pipeline.
+
+---
+
+## Memory-Safe Credential Storage
+
+### Octelium: SecretManager with Watch-Based Invalidation
+
+Octelium's `SecretManager` (`cluster/vigil/vigil/modes/httpg/secretman/secretman.go`)
+uses an in-memory cache with explicit lifecycle management:
+
+```go
+// secretman.go:39-49
+type SecretManager struct {
+    mu          sync.Mutex
+    octeliumC   octeliumc.ClientInterface
+    c           *cache.Cache     // go-cache: no-expiration, 10min cleanup
+    vCache      *vcache.Cache
+    secretNames []string
+    oauth2ccMap struct {
+        sync.Mutex
+        oauth2ccMap map[string]*oauth2ClientCredentialsInfo
+    }
+}
+```
+
+Key safety properties:
+
+1. **Bounded scope:** Only secrets referenced by the active service config are loaded
+   (via `ApplyService` / `doSetCfgSecrets`)
+2. **Watch-based invalidation:** Secret controller watches for `OnAdd`, `OnUpdate`, `OnDelete`
+   events and updates the cache
+3. **Mutex-guarded writes:** All mutations to `secretNames` and `oauth2ccMap` are mutex-protected
+4. **Cache flush on service change:** `ApplyService` calls `s.c.Flush()` before reloading
+5. **OAuth2 token source management:** Token sources are lazily initialized and cached by
+   a SHA256 hash of `(ClientID, SecretName, TokenURL)`
+
+```go
+// secretman.go:68-81 - Cached secret lookup
+func (s *SecretManager) GetByName(ctx context.Context, name string) (*corev1.Secret, error) {
+    if sI, ok := s.c.Get(name); ok {
+        return sI.(*corev1.Secret), nil
+    }
+    ret, err := s.octeliumC.CoreC().GetSecret(ctx, &rmetav1.GetOptions{Name: name})
+    if err != nil {
+        return nil, err
+    }
+    s.c.Set(ret.Metadata.Name, ret, 0)
+    return ret, nil
+}
+```
+
+### Credential-Proxy: Stateless Per-Request Fetch
+
+Credential-proxy does not store secrets in memory beyond the lifetime of a single
+request. The `vault.SecretStore` interface fetches credentials directly from
+OpenBao on each request:
+
+```go
+// vault/client.go
+type SecretStore interface {
+    FetchCredential(ctx context.Context, path string) (*SecretResponse, error)
+}
+```
+
+The only persistent in-memory state is the `connTokens sync.Map` which stores
+JWT tokens extracted during CONNECT handshakes, keyed by remote address.
+These are cleaned up after the response handler completes.
+
+### Assessment
+
+| Aspect | Octelium | Credential-Proxy |
+|--------|----------|------------------|
+| Secret residence | In-memory cache (until flush) | Transient (request-scoped) |
+| Invalidation | Watch-based (event-driven) | Not applicable |
+| Concurrency safety | `sync.Mutex` on writes, `go-cache` thread-safe reads | `sync.Map` for connTokens only |
+| Exposure window | Secrets live in memory for service lifetime | Secrets live in memory for request duration |
+| Secret enumeration | `secretNames` slice limits scope | No enumeration (Vault path lookup) |
+
+**Adoption recommendation:** Credential-proxy's stateless model minimizes the secret
+exposure window, which is a strong security property for an agent-facing proxy. If
+secret caching is added for performance, adopt Octelium's bounded-scope pattern:
+only cache secrets that are actively referenced by configuration, and implement
+TTL-based expiration (not the unlimited TTL that Octelium uses). Consider using
+`memguard` or similar for zeroing secret values on eviction.
+
+---
+
+## Summary of Patterns and Adoption Recommendations
+
+```{r pattern_table, echo=FALSE, eval=TRUE, results='asis'}
+patterns <- data.frame(
+  Pattern = c(
+    "Secret caching with TTL",
+    "OAuth2 client credentials flow",
+    "Typed auth scheme union",
+    "CEL expression engine",
+    "Watch-based secret invalidation",
+    "Priority-sorted policy rules",
+    "Multi-protocol mode selection",
+    "CRD-based configuration",
+    "Dynamic config selection",
+    "Session-based routing",
+    "14-stage middleware pipeline",
+    "Response scrubbing (ours)"
+  ),
+  Source = c(
+    "Octelium SecretManager",
+    "Octelium SecretManager",
+    "Octelium corev1 protobuf",
+    "Octelium CELEngine",
+    "Octelium secret controller",
+    "Octelium Octovigil policy.go",
+    "Octelium Vigil modes/",
+    "Octelium apiserver CRDs",
+    "Octelium auth.go DynamicConfig",
+    "Octelium loadbalancer",
+    "Octelium httpg server.go",
+    "Credential-proxy sanitizer"
+  ),
+  Priority = c(
+    "High", "High", "Medium", "Low", "Medium",
+    "Low", "None", "None", "None", "None", "None", "Keep"
+  ),
+  Recommendation = c(
+    "Adopt: add go-cache with 5-30s TTL per secret",
+    "Adopt: use golang.org/x/oauth2/clientcredentials",
+    "Consider: move from string enum to struct-per-type",
+    "Defer: OPA sufficient for authz-only use case",
+    "Consider: add fsnotify for policy file changes",
+    "Defer: single allow/deny query sufficient now",
+    "Skip: HTTP-only is correct for MITM agent proxy",
+    "Skip: YAML config appropriate for single-proxy",
+    "Skip: static domain config sufficient",
+    "Skip: Vault-centric approach is simpler",
+    "Skip: 5-stage pipeline is right-sized",
+    "Keep: critical for untrusted agent scenarios"
+  ),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(patterns, align = c("l", "l", "c", "l"),
+             caption = "Octelium patterns evaluated for credential-proxy adoption")
+```
+
+---
+
+## Key Takeaways for Credential-Proxy
+
+### What to adopt
+
+1. **Secret caching with bounded TTL.** Octelium's `SecretManager` demonstrates
+   that caching secrets with a `go-cache` instance dramatically reduces upstream latency.
+   For credential-proxy, add a cache layer between `vault.SecretStore` and the request
+   handler with a configurable TTL of 5--30 seconds. Use the bounded-scope pattern:
+   only cache secrets referenced by `config.Credentials`.
+
+2. **OAuth2 client credentials flow.** Octelium's `GetOAuth2CCToken` method
+   (`secretman.go:275--328`) shows how to lazily initialize and cache token sources
+   using `golang.org/x/oauth2/clientcredentials`. This enables proxying to services
+   that require OAuth2 authentication without manual bearer token management.
+
+3. **Structured auth scheme types.** Moving from `CredentialType` string enum + manual
+   `HeaderName`/`HeaderPrefix` to scheme-specific structs (even in YAML) would prevent
+   misconfiguration. Each scheme should know how to construct its own header value.
+
+### What to defer
+
+4. **CEL policy engine.** OPA is sufficient for credential-proxy's authorization-only
+   use case. CEL would be valuable only if dynamic header injection or per-request
+   routing rules become requirements.
+
+5. **Watch-based invalidation.** File-based policy watching (via `fsnotify`) is worth
+   considering for hot-reloading OPA policies, but is not blocking for initial deployment.
+
+### What to skip
+
+6. **Multi-protocol modes, CRD configuration, dynamic config selection, session-based
+   routing, and the 14-stage middleware pipeline** are all over-engineered for
+   credential-proxy's focused scope. The current 5-stage pipeline operating over
+   VSOCK with a static YAML config is architecturally appropriate.
+
+### What we do better
+
+7. **Response scrubbing.** Octelium does not scrub credential values from responses
+   because it assumes trusted upstream services. Credential-proxy's `ScrubCredentials`
+   pattern is essential for untrusted agent scenarios and should be retained.
+
+8. **Fail-closed domain allowlist.** Octelium routes requests based on dynamic service
+   config, which requires careful policy authoring to prevent credential leakage.
+   Credential-proxy's explicit `AllowedDomains` allowlist with fail-closed behavior
+   is a stronger security primitive for the agent proxy use case.
+
+9. **Placeholder-based credential binding.** Octelium injects credentials transparently
+   at the gateway. Credential-proxy's placeholder model means credential values are
+   never visible in agent-side logs, audit trails, or error messages -- a meaningful
+   security improvement for multi-tenant agent orchestration.

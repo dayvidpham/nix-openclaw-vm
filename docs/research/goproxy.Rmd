@@ -1,0 +1,932 @@
+---
+title: "elazarl/goproxy - HTTP Proxy Handler Pattern Analysis"
+date: "2026-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+## Overview
+
+This report documents the handler patterns, MITM TLS implementation details, and
+condition-based routing system in the `elazarl/goproxy` library. The analysis was
+conducted by reading the goproxy source code at `~/codebases/elazarl/goproxy/` and
+cross-referencing with the credential-proxy implementation at
+`credential-proxy/proxy/handlers.go` and `credential-proxy/proxy/gateway.go`.
+
+The credential-proxy uses goproxy as its foundation for intercepting HTTPS traffic,
+injecting credentials from Vault, and scrubbing secrets from responses. Understanding
+goproxy's internal patterns is critical for maintaining correctness and avoiding
+subtle bugs.
+
+---
+
+## Handler Registration
+
+### The Three Handler Types
+
+goproxy exposes three handler interfaces, each covering a distinct phase of the
+proxy lifecycle. All are defined in `actions.go`.
+
+```go
+// Request handler: intercepts before forwarding upstream.
+// Return (req, nil) to forward, or (nil, resp) to short-circuit.
+type ReqHandler interface {
+    Handle(req *http.Request, ctx *ProxyCtx) (*http.Request, *http.Response)
+}
+
+// Response handler: intercepts after receiving upstream response.
+type RespHandler interface {
+    Handle(resp *http.Response, ctx *ProxyCtx) *http.Response
+}
+
+// CONNECT handler: decides what to do with HTTPS tunnel requests.
+type HttpsHandler interface {
+    HandleConnect(req string, ctx *ProxyCtx) (*ConnectAction, string)
+}
+```
+
+Each has a corresponding `Func` adapter (`FuncReqHandler`, `FuncRespHandler`,
+`FuncHttpsHandler`) that wraps a plain function into the interface.
+
+### Registration via OnRequest / OnResponse
+
+Handlers are registered through a fluent API defined in `dispatcher.go:219-254`:
+
+```go
+proxy.OnRequest(conds...).Do(handler)       // ReqHandler
+proxy.OnRequest(conds...).DoFunc(f)         // FuncReqHandler shorthand
+proxy.OnResponse(conds...).Do(handler)      // RespHandler
+proxy.OnResponse(conds...).DoFunc(f)        // FuncRespHandler shorthand
+proxy.OnRequest(conds...).HandleConnect(h)  // HttpsHandler
+```
+
+`OnRequest()` returns a `ReqProxyConds` struct that aggregates conditions. The `Do`
+method wraps the handler with a condition-checking preamble before appending it to
+the proxy's internal handler slices (`reqHandlers`, `respHandlers`, `httpsHandlers`).
+
+### Handler Execution: First-Match-Wins for Requests
+
+The `filterRequest` function in `proxy.go:70-81` iterates through `reqHandlers` in
+registration order. If any handler returns a non-nil response, the chain breaks
+immediately:
+
+```go
+func (proxy *ProxyHttpServer) filterRequest(r *http.Request, ctx *ProxyCtx) (req *http.Request, resp *http.Response) {
+    req = r
+    for _, h := range proxy.reqHandlers {
+        req, resp = h.Handle(req, ctx)
+        if resp != nil {
+            break  // First handler returning a response wins
+        }
+    }
+    return
+}
+```
+
+Response handlers, by contrast, run **all** in sequence (`proxy.go:83-90`).
+Every registered response handler sees (and can modify) the response, regardless
+of what previous handlers did.
+
+### Credential-Proxy's Current Registration
+
+Our `registerHandlers` in `handlers.go:25-39` uses the unconditional form:
+
+```go
+func registerHandlers(gw *Gateway) {
+    gw.proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(
+        func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+            return gw.handleConnect(host, ctx)
+        },
+    ))
+    gw.proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+        return gw.handleRequest(req, ctx)
+    })
+    gw.proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+        return gw.handleResponse(resp, ctx)
+    })
+}
+```
+
+This registers a single handler of each type with no conditions, meaning our
+handler logic runs for every request. Domain filtering is done manually inside
+`handleConnect`. See the [Condition-Based Routing](#condition-based-routing)
+section for an alternative approach.
+
+---
+
+## MITM CONNECT Handling
+
+### The Full CONNECT Flow
+
+The CONNECT lifecycle spans three phases, crossing distinct `ProxyCtx` instances.
+Understanding this flow is critical for correctly passing state between phases.
+
+**Phase 1: CONNECT Request Arrives** (`https.go:122-146`)
+
+```go
+func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request) {
+    ctx := &ProxyCtx{Req: r, Session: atomic.AddInt64(&proxy.sess, 1),
+                     Proxy: proxy, certStore: proxy.CertStore}
+
+    hij, ok := w.(http.Hijacker)
+    if !ok { panic("httpserver does not support hijacking") }
+    proxyClient, _, e := hij.Hijack()
+    if e != nil { panic("Cannot hijack connection " + e.Error()) }
+
+    todo, host := OkConnect, r.URL.Host
+    for i, h := range proxy.httpsHandlers {
+        newtodo, newhost := h.HandleConnect(host, ctx)
+        if newtodo != nil {
+            todo, host = newtodo, newhost
+            break   // First non-nil result wins
+        }
+    }
+    // ... switch on todo.Action
+}
+```
+
+Key observations:
+
+- A fresh `ProxyCtx` is created with the CONNECT request.
+- The default action is `OkConnect` (plain tunnel, no MITM).
+- CONNECT handlers are iterated; the first returning non-nil wins.
+- Connection is hijacked from `net/http` before handler iteration.
+
+**Phase 2: MITM Tunnel Setup** (`https.go:209-247`)
+
+When `ConnectMitm` is the chosen action:
+
+1. Proxy sends `HTTP/1.0 200 OK` to the client.
+2. A goroutine is spawned for the MITM processing loop.
+3. Client-side TLS is detected by peeking at the first byte (`_tlsRecordTypeHandshake`).
+4. A per-host TLS certificate is generated via `TLSConfigFromCA`.
+5. TLS handshake is performed with the client.
+
+**Phase 3: Request Processing Inside Tunnel** (`https.go:250-386`)
+
+Inside the MITM tunnel, each HTTP request from the client creates a **new** `ProxyCtx`:
+
+```go
+ctx := &ProxyCtx{
+    Req:       req,
+    Session:   atomic.AddInt64(&proxy.sess, 1),
+    Proxy:     proxy,
+    UserData:  ctx.UserData,    // CARRIED OVER from CONNECT phase
+    certStore: proxy.CertStore,
+}
+```
+
+The critical line is `UserData: ctx.UserData` -- UserData IS propagated from
+the CONNECT-phase context to each request context within the tunnel. However,
+the `Req` field changes to the actual HTTP request (not the CONNECT request),
+and `Session` gets a new ID.
+
+### UserData Propagation
+
+UserData flows in one direction through the pipeline:
+
+```
+HandleConnect (ctx1)  -->  OnRequest (ctx2)  -->  OnResponse (ctx2)
+      |                        ^
+      |  UserData carried      |
+      +------------------------+
+```
+
+- `ctx1.UserData` set in HandleConnect is copied to `ctx2.UserData` in OnRequest.
+- OnRequest and OnResponse share the same `ctx2`, so `ctx.UserData` set in
+  OnRequest is directly visible in OnResponse.
+- Our `handlers.go:164` correctly sets `ctx.UserData = &requestState{scrubMap: scrubMap}`
+  in the request handler, and `handlers.go:205-208` retrieves it in the response handler.
+
+### The RemoteAddr Token Bridge Problem
+
+The CONNECT request and subsequent tunneled requests have separate `ProxyCtx`
+instances with different `Req` objects. The CONNECT request's `Proxy-Authorization`
+header is available during `HandleConnect`, but is stripped by `RemoveProxyHeaders`
+before `OnRequest` fires.
+
+Our solution in `handlers.go:60-63` correctly bridges this gap:
+
+```go
+// In handleConnect: store token keyed by remote address
+gw.connTokens.Store(ctx.Req.RemoteAddr, rawToken)
+
+// In handleRequest: retrieve via resolveToken
+func (gw *Gateway) resolveToken(req *http.Request) string {
+    if v, ok := gw.connTokens.Load(req.RemoteAddr); ok {
+        if token, ok := v.(string); ok && token != "" {
+            return token
+        }
+    }
+    return extractBearerToken(req.Header.Get("Proxy-Authorization"))
+}
+```
+
+Inside the MITM tunnel (`https.go:269`), `req.RemoteAddr = r.RemoteAddr` preserves
+the original client IP, so our `connTokens` lookup works correctly.
+
+---
+
+## OnRequest / OnResponse Patterns
+
+### Short-Circuiting with Canned Responses
+
+The canonical pattern for rejecting a request in an `OnRequest` handler is to return
+`(req, resp)` where `resp` is non-nil. goproxy provides `NewResponse` for this
+(`responses.go:17-32`):
+
+```go
+func NewResponse(r *http.Request, contentType string, status int, body string) *http.Response {
+    resp := &http.Response{}
+    resp.Request = r
+    resp.TransferEncoding = r.TransferEncoding
+    resp.Header = make(http.Header)
+    resp.Header.Add("Content-Type", contentType)
+    resp.StatusCode = status
+    resp.Status = http.StatusText(status)
+    resp.Proto = "HTTP/1.1"
+    resp.ProtoMajor = 1
+    resp.ProtoMinor = 1
+    buf := bytes.NewBufferString(body)
+    resp.ContentLength = int64(buf.Len())
+    resp.Body = io.NopCloser(buf)
+    return resp
+}
+```
+
+Our `errorResponse` wrapper in `handlers.go:248-250` correctly delegates to this:
+
+```go
+func errorResponse(req *http.Request, code int, msg string) *http.Response {
+    return goproxy.NewResponse(req, "text/plain", code, msg)
+}
+```
+
+### Body Modification and Content-Length
+
+goproxy uses two strategies for Content-Length after body modification:
+
+**Strategy 1: Plain HTTP** (`http.go:61-63`). If the body reference changes,
+delete Content-Length and let `http.ResponseWriter` calculate it:
+
+```go
+if origBody != resp.Body {
+    resp.Header.Del("Content-Length")
+}
+```
+
+**Strategy 2: MITM HTTPS** (`https.go:339-350`). If the body is modified or
+Content-Length is unknown, switch to chunked transfer encoding:
+
+```go
+if bodyModified || (resp.ContentLength <= 0 && resp.Header.Get("Content-Length") == "") {
+    resp.ContentLength = -1
+    resp.Header.Del("Content-Length")
+    resp.TransferEncoding = []string{"chunked"}
+}
+```
+
+Our credential-proxy explicitly recalculates Content-Length after modification,
+which is also correct but less resilient to edge cases:
+
+```go
+// In ReplaceInRequest:
+req.Body = io.NopCloser(bytes.NewReader(replaced))
+req.ContentLength = int64(len(replaced))
+req.Header.Set("Content-Length", strconv.Itoa(len(replaced)))
+
+// In ScrubCredentials:
+resp.Body = io.NopCloser(bytes.NewReader(scrubbedBytes))
+resp.ContentLength = int64(len(scrubbedBytes))
+resp.Header.Set("Content-Length", strconv.Itoa(len(scrubbedBytes)))
+```
+
+This is correct because we always read the full body into memory, modify it, and
+know the exact resulting length. The chunked encoding approach is only needed when
+the final size is unknown.
+
+### Response Handler Receives nil
+
+Response handlers must handle `nil` responses. This occurs when the upstream
+request fails entirely. The `ctx.Error` field will contain the error in this case.
+Our `handleResponse` in `handlers.go:201-203` correctly guards against this:
+
+```go
+if resp == nil {
+    return resp
+}
+```
+
+---
+
+## Certificate Management
+
+### TLSConfigFromCA
+
+The per-host certificate generation is handled by `TLSConfigFromCA` in
+`https.go:555-581`:
+
+```go
+func TLSConfigFromCA(ca *tls.Certificate) func(host string, ctx *ProxyCtx) (*tls.Config, error) {
+    return func(host string, ctx *ProxyCtx) (*tls.Config, error) {
+        var err error
+        var cert *tls.Certificate
+
+        hostname := stripPort(host)
+        config := defaultTLSConfig.Clone()
+
+        genCert := func() (*tls.Certificate, error) {
+            return signer.SignHost(*ca, []string{hostname})
+        }
+        if ctx.certStore != nil {
+            cert, err = ctx.certStore.Fetch(hostname, genCert)
+        } else {
+            cert, err = genCert()
+        }
+
+        if err != nil {
+            ctx.Warnf("Cannot sign host certificate with provided CA: %s", err)
+            return nil, err
+        }
+
+        config.Certificates = append(config.Certificates, *cert)
+        return config, nil
+    }
+}
+```
+
+Key points:
+
+- Returns a closure that captures the CA certificate.
+- Each hostname gets a unique certificate signed by the CA via `signer.SignHost`.
+- If `ctx.certStore` is set, certificates are cached through the `CertStorage` interface.
+- Without a cert store, a new certificate is generated for every CONNECT request.
+
+### CertStorage Interface
+
+Defined in `ctx.go:37-39`:
+
+```go
+type CertStorage interface {
+    Fetch(hostname string, gen func() (*tls.Certificate, error)) (*tls.Certificate, error)
+}
+```
+
+The reference implementation from `examples/certstorage/cache.go` uses a
+`sync.RWMutex`-protected map:
+
+```go
+type CertStorage struct {
+    certs map[string]*tls.Certificate
+    mtx   sync.RWMutex
+}
+
+func (cs *CertStorage) Fetch(hostname string, gen func() (*tls.Certificate, error)) (*tls.Certificate, error) {
+    cs.mtx.RLock()
+    cert, ok := cs.certs[hostname]
+    cs.mtx.RUnlock()
+    if ok {
+        return cert, nil
+    }
+
+    cert, err := gen()
+    if err != nil {
+        return nil, err
+    }
+
+    cs.mtx.Lock()
+    cs.certs[hostname] = cert
+    cs.mtx.Unlock()
+    return cert, nil
+}
+```
+
+### Global CA Setup
+
+The global CA is set via `goproxy.GoproxyCa`. Pre-built `ConnectAction` variables
+(`OkConnect`, `MitmConnect`, `RejectConnect`) reference this global at package init
+time via `TLSConfigFromCA(&GoproxyCa)`.
+
+Our `gateway.go:40-47` correctly loads a custom CA:
+
+```go
+if cfg.CACertPath != "" && cfg.CAKeyPath != "" {
+    ca, err := tls.LoadX509KeyPair(cfg.CACertPath, cfg.CAKeyPath)
+    if err != nil {
+        return nil, fmt.Errorf("load MITM CA certificate: %w", err)
+    }
+    goproxy.GoproxyCa = ca
+}
+```
+
+The `customca` example (`examples/customca/main.go`) shows an alternative pattern
+using a custom `ConnectAction`:
+
+```go
+cert, err := parseCA(_caCert, _caKey)
+customCaMitm := &goproxy.ConnectAction{
+    Action:    goproxy.ConnectMitm,
+    TLSConfig: goproxy.TLSConfigFromCA(cert),
+}
+proxy.OnRequest().HandleConnect(
+    goproxy.FuncHttpsHandler(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+        return customCaMitm, host
+    }),
+)
+```
+
+This avoids mutating the global `GoproxyCa` and is safer if multiple proxy
+instances with different CAs exist in the same process.
+
+### Recommendation: Add Certificate Caching
+
+Our proxy currently does not set `proxy.CertStore`, meaning a new certificate is
+generated for every CONNECT request. For production use with many concurrent
+connections to the same host, adding a cert store would reduce CPU overhead:
+
+```go
+proxy.CertStore = NewCertStorage()  // Using the pattern from examples/certstorage/
+```
+
+---
+
+## UserData Propagation
+
+### Lifecycle
+
+`UserData` is a field of type `any` on `ProxyCtx` (`ctx.go:26`):
+
+```go
+// A handle for the user to keep data in the context, from the call of ReqHandler to the
+// call of RespHandler
+UserData any
+```
+
+The propagation path:
+
+1. **HandleConnect**: Can set `ctx.UserData` on the CONNECT-phase context.
+2. **MITM tunnel creates new context**: `UserData` is copied from the CONNECT
+   context to each per-request context (`https.go:257`).
+3. **OnRequest**: Can read/write `ctx.UserData`. Same `ctx` instance persists
+   through to OnResponse.
+4. **OnResponse**: Reads `ctx.UserData` set by OnRequest.
+
+### Our Usage Pattern
+
+We use `UserData` to pass the scrub map from OnRequest to OnResponse:
+
+```go
+// In handleRequest (handlers.go:164):
+ctx.UserData = &requestState{scrubMap: scrubMap}
+
+// In handleResponse (handlers.go:205-208):
+state, ok := ctx.UserData.(*requestState)
+if !ok || state == nil || len(state.scrubMap) == 0 {
+    return resp
+}
+```
+
+This is the idiomatic goproxy pattern. We do NOT set UserData in HandleConnect
+(we use `connTokens` sync.Map instead for token bridging), which is correct because
+the CONNECT phase needs to store the JWT, but the OnRequest phase creates a fresh
+`requestState` per request.
+
+---
+
+## Condition-Based Routing
+
+### Built-In Conditions
+
+goproxy provides a composable condition system in `dispatcher.go:12-211`. All
+conditions implement `ReqCondition` or `RespCondition`:
+
+| Condition | Type | Description | Source |
+|-----------|------|-------------|--------|
+| `DstHostIs(host)` | `ReqConditionFunc` | Case-insensitive hostname match, optional port | `dispatcher.go:136-158` |
+| `ReqHostIs(hosts...)` | `ReqConditionFunc` | Match against set of `req.URL.Host` values | `dispatcher.go:97-106` |
+| `ReqHostMatches(regexps...)` | `ReqConditionFunc` | Regex match on `req.Host` | `dispatcher.go:84-93` |
+| `UrlHasPrefix(prefix)` | `ReqConditionFunc` | URL path prefix match | `dispatcher.go:50-64` |
+| `UrlIs(urls...)` | `ReqConditionFunc` | Exact URL path match | `dispatcher.go:70-80` |
+| `UrlMatches(re)` | `ReqConditionFunc` | Regex URL match | `dispatcher.go:128-133` |
+| `SrcIpIs(ips...)` | `ReqConditionFunc` | Source IP filtering | `dispatcher.go:161-170` |
+| `IsLocalHost` | `ReqConditionFunc` | Loopback address check | `dispatcher.go:109-124` |
+| `Not(cond)` | `ReqConditionFunc` | Negation combinator | `dispatcher.go:173-177` |
+| `ContentTypeIs(types...)` | `RespConditionFunc` | Response Content-Type check | `dispatcher.go:181-195` |
+| `StatusCodeIs(codes...)` | `RespConditionFunc` | HTTP status code check | `dispatcher.go:199-211` |
+
+### Condition Composition (AND Chaining)
+
+Multiple conditions passed to `OnRequest(cond1, cond2)` are AND-chained. All must
+return `true` for the handler to fire. From `dispatcher.go:244-254`:
+
+```go
+func (pcond *ReqProxyConds) Do(h ReqHandler) {
+    pcond.proxy.reqHandlers = append(pcond.proxy.reqHandlers,
+        FuncReqHandler(func(req *http.Request, ctx *ProxyCtx) (*http.Request, *http.Response) {
+            for _, cond := range pcond.reqConds {
+                if !cond.HandleReq(req, ctx) {
+                    return req, nil  // Condition not met, pass through
+                }
+            }
+            return h.Handle(req, ctx)
+        }))
+}
+```
+
+The same AND-chaining applies to `HandleConnect` (`dispatcher.go:268-276`):
+
+```go
+func (pcond *ReqProxyConds) HandleConnect(h HttpsHandler) {
+    pcond.proxy.httpsHandlers = append(pcond.proxy.httpsHandlers,
+        FuncHttpsHandler(func(host string, ctx *ProxyCtx) (*ConnectAction, string) {
+            for _, cond := range pcond.reqConds {
+                if !cond.HandleReq(ctx.Req, ctx) {
+                    return nil, ""  // Condition not met, skip this handler
+                }
+            }
+            return h.HandleConnect(host, ctx)
+        }))
+}
+```
+
+When conditions are not met, the handler returns `nil, ""`, causing `handleHttps`
+to continue iterating to the next handler.
+
+### Custom Conditions
+
+To implement OR logic or domain-allowlist conditions, create a `ReqConditionFunc`:
+
+```go
+func AllowedDomainCondition(cfg *config.Config) goproxy.ReqConditionFunc {
+    return func(req *http.Request, ctx *goproxy.ProxyCtx) bool {
+        domain := stripPort(req.Host)
+        return cfg.IsAllowedDomain(domain)
+    }
+}
+```
+
+### Potential Improvement: Declarative Domain Filtering
+
+Our current `handleConnect` manually checks domain allowlists inside the handler
+body (`handlers.go:48-51`):
+
+```go
+if !gw.cfg.IsAllowedDomain(domain) {
+    slog.Warn("CONNECT rejected", ...)
+    return goproxy.RejectConnect, host
+}
+```
+
+With conditions, this could become declarative. However, there is a tradeoff:
+the condition approach requires registering separate handlers for allowed and
+rejected domains, and the logging of rejection reasons becomes less direct.
+Our current approach is functionally correct and keeps the logic co-located.
+
+---
+
+## Error Handling
+
+### Request Handler Errors
+
+Request handlers signal errors by returning a non-nil response:
+
+```go
+return req, errorResponse(req, http.StatusForbidden, "access denied")
+```
+
+This short-circuits the handler chain and prevents the request from reaching the
+upstream server. Our `handlers.go` uses this pattern consistently for all error
+paths (missing token, verification failure, unknown placeholder, authz denial,
+vault fetch failure, injection failure).
+
+### ctx.Error Field
+
+When the upstream round-trip fails, goproxy sets `ctx.Error` (`http.go:28-29`):
+
+```go
+resp, err = ctx.RoundTrip(r)
+if err != nil {
+    ctx.Error = err
+}
+```
+
+This is then available to response handlers. If both `resp` and `ctx.Error` are
+examined, the handler can distinguish between "upstream returned an error response"
+and "upstream was unreachable".
+
+### CONNECT Handler Errors
+
+The `HandleConnect` interface has no dedicated error return. The only options are:
+
+1. Return `RejectConnect` to close the connection (what we do).
+2. Return `ConnectHijack` and write a custom error response to the raw connection.
+3. Set `ctx.UserData` with error information for downstream handlers.
+
+### Panic Safety
+
+goproxy does NOT recover from panics in handlers. Two panics exist in the
+CONNECT setup path (`https.go:127,132`) for the case where the HTTP server
+does not support hijacking -- these are initialization-time assertions, not
+runtime handler panics.
+
+**Anti-pattern**: Panicking in a request or response handler will crash the
+entire proxy process. All error paths must return values, never panic.
+
+### Our Error Handling Assessment
+
+Our handler error paths are well-structured:
+
+- Every error returns a descriptive HTTP response with an appropriate status code.
+- Structured logging (`slog.Warn`, `slog.Error`) captures context for debugging.
+- No panics in any handler path.
+- The `errorResponse` helper ensures consistent error response formatting.
+
+---
+
+## ConnectAction Options
+
+### Available Actions
+
+Defined in `https.go:22-40`:
+
+```go
+const (
+    ConnectAccept          = iota  // Tunnel bytes without inspection
+    ConnectReject                  // Reject with error, close connection
+    ConnectMitm                   // MITM: TLS intercept, request/response handlers active
+    ConnectHijack                  // Caller takes full control of connection
+    ConnectHTTPMitm                // Deprecated: use ConnectMitm
+    ConnectProxyAuthHijack         // Return 407 then call Hijack function
+)
+```
+
+### Pre-Built ConnectAction Variables
+
+```go
+var (
+    OkConnect       = &ConnectAction{Action: ConnectAccept, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+    MitmConnect     = &ConnectAction{Action: ConnectMitm,   TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+    HTTPMitmConnect = &ConnectAction{Action: ConnectHTTPMitm, TLSConfig: TLSConfigFromCA(&GoproxyCa)}  // Deprecated
+    RejectConnect   = &ConnectAction{Action: ConnectReject, TLSConfig: TLSConfigFromCA(&GoproxyCa)}
+)
+```
+
+### ConnectAction Struct
+
+```go
+type ConnectAction struct {
+    Action    ConnectActionLiteral
+    Hijack    func(req *http.Request, client net.Conn, ctx *ProxyCtx)
+    TLSConfig func(host string, ctx *ProxyCtx) (*tls.Config, error)
+}
+```
+
+The `TLSConfig` field is a **function**, enabling per-host certificate customization.
+The `Hijack` function is only used when `Action` is `ConnectHijack` or
+`ConnectProxyAuthHijack`.
+
+### Selective MITM
+
+There is no built-in "MITM only for certain domains" action -- this must be
+implemented by the handler returning different actions based on the host:
+
+```go
+proxy.OnRequest(goproxy.DstHostIs("api.example.com")).HandleConnect(goproxy.AlwaysMitm)
+proxy.OnRequest().HandleConnect(goproxy.AlwaysReject)  // Default: reject all others
+```
+
+Or, as we do, with a single handler that switches based on domain allowlisting.
+
+---
+
+## Proxy-Authorization Handling
+
+### Automatic Stripping
+
+`RemoveProxyHeaders` in `proxy.go:92-120` strips `Proxy-Authorization` (along with
+`Proxy-Connection` and `Proxy-Authenticate`) before forwarding requests upstream:
+
+```go
+func RemoveProxyHeaders(ctx *ProxyCtx, r *http.Request) {
+    r.RequestURI = ""
+    if !ctx.Proxy.KeepAcceptEncoding { r.Header.Del("Accept-Encoding") }
+    r.Header.Del("Proxy-Connection")
+    r.Header.Del("Proxy-Authenticate")
+    r.Header.Del("Proxy-Authorization")
+    if !isWebSocketHandshake(r.Header) { r.Header.Del("Connection") }
+}
+```
+
+This is called in `handleHttp` unless `proxy.KeepHeader` is true (`http.go:21-23`),
+and similarly in the MITM tunnel request path (`https.go:328`).
+
+### When Proxy-Authorization Is Available
+
+| Phase | Available? | Notes |
+|-------|-----------|-------|
+| HandleConnect | Yes | `ctx.Req.Header.Get("Proxy-Authorization")` works |
+| OnRequest (plain HTTP) | Yes | Available before `RemoveProxyHeaders` is called |
+| OnRequest (CONNECT tunnel) | No | Header was on the CONNECT request, not on tunneled requests |
+
+### Our Approach
+
+We extract the token during HandleConnect and cache it in `connTokens`:
+
+```go
+// handleConnect (handlers.go:54):
+rawToken := extractBearerToken(ctx.Req.Header.Get("Proxy-Authorization"))
+gw.connTokens.Store(ctx.Req.RemoteAddr, rawToken)
+
+// handleRequest (handlers.go:78-79):
+req.Header.Del("Proxy-Authorization")  // Defensive: strip even though goproxy does it too
+```
+
+The explicit `Header.Del` in handleRequest is good defensive programming --
+it ensures the header is removed even if `KeepHeader` were set to `true`.
+
+---
+
+## Testing Patterns
+
+### Integration Test Setup from goproxy
+
+The canonical test pattern from `proxy_test.go:128-140`:
+
+```go
+func oneShotProxy(proxy *goproxy.ProxyHttpServer) (client *http.Client, s *httptest.Server) {
+    s = httptest.NewServer(proxy)
+    proxyUrl, _ := url.Parse(s.URL)
+    tr := &http.Transport{
+        TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+        Proxy:           http.ProxyURL(proxyUrl),
+    }
+    client = &http.Client{Transport: tr}
+    return
+}
+```
+
+Key elements:
+
+- `httptest.NewServer(proxy)` wraps the proxy as a standard HTTP test server.
+- `InsecureSkipVerify: true` is required for MITM testing (the generated certs
+  are not in the system trust store).
+- The returned `client` routes all requests through the proxy.
+
+### Example Test: MITM with Filtering
+
+```go
+func TestMitmIsFiltered(t *testing.T) {
+    proxy := goproxy.NewProxyHttpServer()
+    proxy.OnRequest(goproxy.ReqHostIs(https.Listener.Addr().String())).HandleConnect(goproxy.AlwaysMitm)
+    proxy.OnRequest(goproxy.UrlIs("/momo")).DoFunc(
+        func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+            return nil, goproxy.TextResponse(req, "koko")
+        },
+    )
+
+    client, l := oneShotProxy(proxy)
+    defer l.Close()
+
+    if resp := string(getOrFail(t, https.URL+"/momo", client)); resp != "koko" {
+        t.Error("Proxy should capture /momo to be koko and not", resp)
+    }
+    if resp := string(getOrFail(t, https.URL+"/bobo", client)); resp != "bobo" {
+        t.Error("But still /bobo should be bobo and not", resp)
+    }
+}
+```
+
+### Example Test: First Handler Wins
+
+```go
+func TestFirstHandlerMatches(t *testing.T) {
+    proxy := goproxy.NewProxyHttpServer()
+    proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+        return nil, goproxy.TextResponse(req, "koko")
+    })
+    proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+        panic("should never get here, previous response is no null")
+    })
+
+    client, l := oneShotProxy(proxy)
+    defer l.Close()
+
+    if resp := string(getOrFail(t, srv.URL+"/", client)); resp != "koko" {
+        t.Error("should return always koko and not", resp)
+    }
+}
+```
+
+### Adoption for credential-proxy
+
+For our integration tests, we should follow the `oneShotProxy` pattern but add:
+
+1. A mock upstream server that echoes placeholders back in responses.
+2. A mock Vault that returns known credentials.
+3. JWT token injection into the `Proxy-Authorization` header for CONNECT requests.
+4. Verification that credentials are injected into upstream requests and scrubbed
+   from responses.
+
+---
+
+## Summary Table
+
+```{r patterns-table, echo=FALSE, eval=TRUE, results='asis'}
+patterns <- data.frame(
+  Pattern = c(
+    "Token caching via sync.Map",
+    "UserData for request-to-response state",
+    "Explicit error responses via NewResponse",
+    "Content-Length update after body modification",
+    "Single catch-all handler per phase",
+    "CA certificate loading via GoproxyCa global",
+    "Fire-and-forget async audit (goroutine)",
+    "Defensive Proxy-Authorization stripping",
+    "Nil response guard in OnResponse",
+    "Condition-based domain filtering",
+    "Certificate caching via CertStore",
+    "Custom ConnectAction with per-instance CA",
+    "Chunked transfer for modified responses"
+  ),
+  Status = c(
+    "In use",
+    "In use",
+    "In use",
+    "In use",
+    "In use",
+    "In use",
+    "In use",
+    "In use",
+    "In use",
+    "Not adopted",
+    "Not adopted",
+    "Not adopted",
+    "Not adopted"
+  ),
+  Recommendation = c(
+    "Keep. Correct bridge between CONNECT and OnRequest contexts.",
+    "Keep. Idiomatic goproxy pattern for passing scrub maps.",
+    "Keep. Consistent error formatting.",
+    "Keep. Correct because we always know the final body size.",
+    "Keep for now. Co-locating logic simplifies reasoning.",
+    "Keep. Works but consider per-instance CA for multi-proxy scenarios.",
+    "Keep. Non-blocking audit is correct design.",
+    "Keep. Defense-in-depth against KeepHeader configuration.",
+    "Keep. Required for upstream connection failures.",
+    "Consider. Move domain allowlist to ReqConditionFunc for declarative routing.",
+    "Adopt. Add CertStorage to avoid re-signing certs for repeated hosts.",
+    "Consider. Avoids mutating global state if multiple proxies exist.",
+    "Optional. Our explicit Content-Length is correct for known-size bodies."
+  ),
+  stringsAsFactors = FALSE
+)
+knitr::kable(patterns, format = "html",
+             caption = "Pattern Adoption Status and Recommendations")
+```
+
+---
+
+## Key Takeaways for credential-proxy
+
+1. **Our handler architecture is correct.** The token-caching via `sync.Map`,
+   UserData propagation for scrub maps, and explicit Content-Length management
+   all follow goproxy's intended patterns.
+
+2. **Certificate caching is the highest-value improvement.** Without a
+   `CertStore`, every CONNECT to the same domain regenerates a TLS certificate.
+   Adding the `examples/certstorage` pattern is low-effort and avoids unnecessary
+   crypto operations under load.
+
+3. **Condition-based routing is a design tradeoff, not a bug.** Our manual
+   domain checking in `handleConnect` is functionally equivalent to using
+   `ReqConditionFunc`. Conditions would make the intent more declarative but
+   would split the CONNECT logic across registration and handler code. The
+   current approach keeps all CONNECT decisions in one place.
+
+4. **Panic safety is critical.** goproxy does not recover from handler panics.
+   Every code path in our handlers must return values, never panic. Our current
+   implementation is correct in this regard.
+
+5. **Proxy-Authorization is ephemeral.** It only exists on the CONNECT request
+   and is stripped before OnRequest fires for tunneled requests. Our `connTokens`
+   bridge is the correct (and only) solution for passing authentication from the
+   CONNECT phase to the request phase.
+
+6. **Response handlers run unconditionally.** Unlike request handlers where
+   first-match-wins, all response handlers execute in sequence. Our single
+   response handler for credential scrubbing is fine, but if we add more, we
+   must be aware that they all run for every response.
+
+7. **Anti-patterns to avoid:**
+   - Panicking in handlers (crashes the proxy).
+   - Modifying body without updating Content-Length (causes client hangs).
+   - Assuming Proxy-Authorization is available in OnRequest for CONNECT tunnels.
+   - Passing `RespCondition` to `OnRequest()` (causes runtime panic).
+   - Blocking synchronous operations in handlers (slows entire proxy).
+
+8. **Testing should follow the `oneShotProxy` pattern.** Use `httptest.NewServer`
+   to wrap the proxy, configure an `http.Client` with `Transport.Proxy` pointing
+   at it, and use `InsecureSkipVerify: true` for MITM testing.

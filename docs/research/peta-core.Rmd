@@ -1,0 +1,697 @@
+---
+title: "Peta Core - JIT Decryption and Audit Trail Pattern Analysis"
+date: "2026-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+## Executive Summary
+
+This report synthesizes security patterns from the Peta Core (TypeScript) and credential-proxy (Go) codebases, focusing on JIT decryption, audit trails, token lifecycle management, and human-in-the-loop (HITL) approval patterns. Both systems implement sophisticated security models preventing credential exfiltration while maintaining observability.
+
+Peta Core is an MCP gateway proxy with OAuth 2.0 integration, custom AES-256-GCM encryption, and comprehensive SQL-based audit logging. The credential-proxy is a Go MITM forward proxy with OpenBao vault integration, OPA policy enforcement, and Temporal-based audit workflows. This study identifies language-agnostic architectural patterns applicable to the credential-proxy's evolution.
+
+**Key source files analyzed:**
+
+- Peta Core: `src/security/CryptoService.ts`, `src/security/TokenValidator.ts`, `src/security/OAuthTokenValidator.ts`, `src/log/LogService.ts`, `src/log/SessionLogger.ts`, `src/oauth/services/OAuthService.ts`, `prisma/schema.prisma`
+- Credential-proxy: `proxy/handlers.go`, `proxy/gateway.go`, `proxy/placeholder.go`, `proxy/sanitizer.go`, `vault/client.go`, `authn/oidc.go`, `authz/engine.go`, `audit/search_attributes.go`, `workflows/activities.go`, `config/config.go`
+
+---
+
+## JIT Decryption Model
+
+### Peta Core: Encryption at Rest with On-Demand Decryption
+
+Peta Core implements application-level encryption using AES-256-GCM with PBKDF2 key derivation. Secrets are encrypted at rest in the database (the `User` model stores an `encryptedToken` field), but decryption occurs immediately upon request inside `TokenValidator` without persistent decrypted storage.
+
+**Encryption parameters:**
+
+- Algorithm: AES-256-GCM (authenticated encryption)
+- Key derivation: PBKDF2 with SHA-256, 100,000 iterations
+- IV length: 96 bits (12 bytes, GCM standard)
+- Salt length: 128 bits (16 bytes)
+
+```typescript
+// CryptoService.ts - Encrypted data transport structure
+export interface EncryptedData {
+  data: string;  // Base64 encoded encrypted data
+  iv: string;    // Base64 encoded initialization vector
+  salt: string;  // Base64 encoded salt for key derivation
+  tag: string;   // Base64 encoded GCM authentication tag
+}
+
+// Key derivation from password
+static async deriveKey(
+  password: string,
+  salt: Uint8Array,
+  iterations: number = 100000,
+  extractable: boolean = false
+): Promise<CryptoKey> {
+  const baseKey = await webcrypto.subtle.importKey(
+    'raw', passwordBuffer, 'PBKDF2', false, ['deriveKey']
+  );
+  return webcrypto.subtle.deriveKey({
+    name: 'PBKDF2',
+    salt: salt,
+    iterations: 100000,
+    hash: 'SHA-256',
+  }, baseKey, {
+    name: 'AES-GCM',
+    length: 256,
+  }, extractable, ['encrypt', 'decrypt']);
+}
+```
+
+The key pattern here is that secrets are encrypted at rest and decrypted on-demand. There is no persistent decrypted cache; the cleartext exists only for the duration of the validation call.
+
+### Credential-Proxy: Just-In-Memory via Vault Fetch
+
+The credential-proxy delegates encryption entirely to OpenBao (HashiCorp Vault fork). Secrets are fetched just-in-time via KV v2 API and exist only in handler-local memory for the duration of a single request.
+
+```go
+// vault/client.go - Fetch credential from OpenBao KV v2
+func (c *OpenBaoClient) FetchCredential(ctx context.Context, vaultPath string) (*CredentialValue, error) {
+    secret, err := c.client.Logical().ReadWithContext(ctx, vaultPath)
+    if err != nil {
+        return nil, fmt.Errorf("read secret %s: %w", vaultPath, err)
+    }
+
+    // KV v2 wraps actual data under a "data" key
+    data, ok := secret.Data["data"].(map[string]interface{})
+    key, _ := data["key"].(string)
+    headerName, _ := data["header_name"].(string)
+    headerPrefix, _ := data["header_prefix"].(string)
+
+    return &CredentialValue{
+        Key:          key,
+        HeaderName:   headerName,
+        HeaderPrefix: headerPrefix,
+    }, nil
+}
+```
+
+In the sealed activity pattern (`workflows/activities.go`), secrets never appear in Temporal workflow history. They exist only in activity-local memory for the duration of execution, and are garbage collected when the activity returns.
+
+### TTL Approaches Compared
+
+Peta Core uses database-level expiration checks against a Unix timestamp field:
+
+```typescript
+// TokenValidator.ts
+if (user.expiresAt && user.expiresAt > 0 &&
+    Math.floor(Date.now() / 1000) > user.expiresAt) {
+  throw new AuthError(AuthErrorType.USER_EXPIRED,
+    'User authorization has expired');
+}
+```
+
+The credential-proxy relies on the OIDC provider's built-in JWT `exp` claim validation:
+
+```go
+// authn/oidc.go - JWT expiration is checked by go-oidc verifier
+idToken, err := v.verifier.Verify(ctx, rawToken)
+if err != nil {
+    return nil, classifyVerifyError(err)  // Returns ErrTokenExpired
+}
+```
+
+Peta Core's OAuth token lifetimes are statically configured:
+
+```typescript
+// oauth.types.ts
+export const OAUTH_CONFIG = {
+  ACCESS_TOKEN_LIFETIME: 3600,           // 1 hour
+  REFRESH_TOKEN_LIFETIME: 2592000,       // 30 days
+  AUTHORIZATION_CODE_LIFETIME: 600,      // 10 minutes
+};
+```
+
+---
+
+## Short-lived Agent Tokens
+
+### Peta Core: Self-Issued OAuth Tokens
+
+Peta Core issues its own OAuth access tokens as JWTs with embedded scopes, client ID, user ID, and expiration. The token lifecycle involves three validation phases:
+
+1. **JWT signature and expiration** -- cryptographic verification
+2. **Database lookup and revocation check** -- persistent revocation flag
+3. **User status verification** -- account enabled and not expired
+
+```typescript
+// OAuthTokenValidator.ts - Three-phase validation
+async validateToken(token: string): Promise<{valid: boolean; authContext?: AuthContext; error?: string}> {
+  // Phase 1: JWT signature + expiration
+  const decoded = jwt.verify(token, jwtSecret) as OAuthTokenPayload;
+  if (decoded.exp && Date.now() / 1000 > decoded.exp) {
+    return { valid: false, error: 'Token has expired' };
+  }
+
+  // Phase 2: Database revocation check
+  const tokenRecord = await prisma.oAuthToken.findUnique({
+    where: { accessToken: token }
+  });
+  if (!tokenRecord || tokenRecord.revoked ||
+      tokenRecord.accessTokenExpiresAt < new Date()) {
+    return false;
+  }
+
+  // Phase 3: User status check
+  if (user.status !== UserStatus.Enabled) {
+    return { valid: false, error: 'User is not active' };
+  }
+}
+```
+
+Token generation encodes scopes immutably in the JWT payload:
+
+```typescript
+// OAuthService.ts
+generateAccessToken(clientId: string, userId: string, scopes: string[], resource?: string): string {
+  const payload = {
+    type: 'access_token',
+    client_id: clientId,
+    user_id: userId,
+    scopes: scopes,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + OAUTH_CONFIG.ACCESS_TOKEN_LIFETIME,
+  };
+  if (resource) { payload.aud = resource; }  // RFC 8707
+  return jwt.sign(payload, jwtSecret);
+}
+```
+
+### Credential-Proxy: External OIDC Tokens (Keycloak)
+
+The credential-proxy uses externally-issued OIDC tokens from Keycloak. There is no self-issued token capability and no token refresh at the proxy layer.
+
+```go
+// authn/oidc.go
+type AgentIdentity struct {
+    Subject   string                 // JWT "sub" claim
+    Roles     []string               // From realm_access.roles
+    Groups    []string               // From "groups" claim
+    RawClaims map[string]interface{} // Full decoded claims for OPA
+}
+
+func (v *OIDCVerifier) VerifyToken(ctx context.Context, rawToken string) (*AgentIdentity, error) {
+    idToken, err := v.verifier.Verify(ctx, rawToken)
+    if err != nil {
+        return nil, classifyVerifyError(err)
+    }
+    return &AgentIdentity{
+        Subject:   idToken.Subject,
+        Roles:     extractRealmRoles(claims),
+        Groups:    extractStringSlice(claims, "groups"),
+        RawClaims: claims,
+    }, nil
+}
+```
+
+**Key differences:**
+
+| Aspect | Peta Core | Credential-Proxy |
+|--------|-----------|------------------|
+| Token issuer | Self-issued (JWT_SECRET) | External (Keycloak OIDC) |
+| Access token TTL | 1 hour | OIDC provider-managed |
+| Refresh support | 30-day refresh tokens | None at proxy layer |
+| Revocation | Database flag per token | Not implemented |
+| Scope enforcement | JWT-embedded scopes | OPA policy evaluation |
+
+---
+
+## HITL Approval Workflows
+
+### Peta Core: OAuth Consent Screen Pattern
+
+Peta Core implements human-in-the-loop approval through the OAuth 2.0 authorization code flow with PKCE:
+
+```typescript
+// oauth.types.ts - Authorization approval
+export interface AuthorizationApprovalRequest {
+  client_id: string;
+  redirect_uri: string;
+  scope?: string;
+  state?: string;
+  code_challenge?: string;
+  code_challenge_method?: string;
+  resource?: string;
+  approved: boolean;       // <-- User's explicit decision
+  user_token: string;      // User's access token
+}
+```
+
+The flow is:
+
+1. Client requests authorization -- user redirected to consent screen
+2. User reviews scopes and approves -- creates an `OAuthAuthorizationCode`
+3. Code expires after 10 minutes if not exchanged
+4. Client exchanges code for token (PKCE prevents code interception)
+
+Authorization codes are single-use, short-lived, and tied to the exact redirect URI:
+
+```typescript
+// Prisma schema
+model OAuthAuthorizationCode {
+  code:            String;    // Random 32-byte hex
+  expiresAt:       DateTime;  // 10 minutes
+  used:            Boolean;   // Prevent code reuse
+  codeChallenge:   String?;   // PKCE: SHA256(code_verifier)
+  challengeMethod: String?;   // S256 or plain
+}
+```
+
+### Credential-Proxy: No HITL at Proxy Layer
+
+The credential-proxy does not implement HITL approval at the proxy layer. Authorization is fully deterministic via OPA policy evaluation:
+
+```go
+// handlers.go - Deterministic policy evaluation, no human approval
+authzResult, err := gw.authz.Evaluate(bgCtx, &authz.AuthzRequest{
+    Identity:     identity.RawClaims,
+    Placeholders: placeholders,
+    TargetDomain: targetDomain,
+    Credentials:  bindings,
+})
+if !authzResult.Allowed {
+    return req, errorResponse(req, http.StatusForbidden,
+        fmt.Sprintf("access denied: %s", authzResult.Reason))
+}
+```
+
+The design rationale is that HITL approval happens upstream in the deployment system (Kubernetes, VM manager). The proxy assumes the agent is already authorized via the OIDC provider and focuses on audit trail rather than blocking requests for human review.
+
+OPA decisions are not cached -- every request is evaluated fresh, which means policy changes take effect immediately (fail-safe behavior).
+
+---
+
+## Audit Trail Patterns
+
+### Peta Core: SQL-Based Batch Logging
+
+Peta Core uses a comprehensive SQL-based logging system with batch queuing for high throughput. The `LogService` accumulates entries and flushes in batches of 100 or every 5 seconds.
+
+```typescript
+// LogService.ts - Batch queue pattern
+class LogService {
+  private logQueue: LogEntry[] = [];
+  private readonly BATCH_SIZE = 100;
+  private readonly FLUSH_INTERVAL = 5000;  // 5 seconds
+
+  private async flush(): Promise<void> {
+    if (this.logQueue.length === 0) return;
+    const batch = [...this.logQueue];
+    this.logQueue = [];
+    await Promise.all(batch.map(entry => LogRepository.save(entry)));
+  }
+}
+```
+
+The `SessionLogger` provides per-session context that is automatically included in every log entry:
+
+```typescript
+// SessionLogger.ts - Context-rich logging
+class SessionLogger {
+  constructor(data: {
+    userId: string;
+    sessionId: string;
+    tokenMask: string;   // First 8 + last 8 chars (safe to log)
+    ip: string;
+    userAgent: string;
+  })
+
+  logClientRequest(data: { action, uniformRequestId, responseResult, ... })
+  logServerRequest(data: { action, serverId, proxyRequestId, ... })
+  logAuth(data: { action, error, requestParams })
+  logError(data: { action, error, serverId, ... })
+}
+```
+
+The log record schema provides comprehensive indexing:
+
+```sql
+-- Prisma schema: Log model
+model Log {
+  id                      Int
+  createdAt               Int        -- Unix timestamp
+  action                  Int        -- MCPEventLogType enum
+  userid                  String
+  serverId                String?
+  sessionId               String
+  upstreamRequestId       String
+  uniformRequestId        String?    -- Unified request tracking
+  parentUniformRequestId  String?    -- Links reverse requests
+  tokenMask               String     -- First 8 + last 8 chars
+  requestParams           String     -- JSON summary of key fields
+  responseResult          String     -- Truncated (300 chars) or full if error
+  error                   String
+  duration                Int?       -- Milliseconds
+  statusCode              Int?
+
+  @@index([userid])
+  @@index([sessionId])
+  @@index([uniformRequestId])
+  @@index([serverId])
+  @@index([createdAt])
+}
+```
+
+Event categories are classified by numeric range: 1001-1006 for client requests, 1101-1106 for server requests, 1201-1206 for reverse requests, 1301-1302 for session lifecycle, 3001-3010 for authentication, and 4000-4099 for errors.
+
+### Credential-Proxy: Temporal Search Attributes
+
+The credential-proxy fires asynchronous Temporal audit workflows on every credential-proxied request:
+
+```go
+// audit/search_attributes.go
+const (
+    AttrAgentID           = "CredProxyAgentID"
+    AttrTargetDomain      = "CredProxyTargetDomain"
+    AttrCredentialRefHash = "CredProxyCredentialRefHash"
+    AttrStatus            = "CredProxyStatus"
+)
+
+type SearchAttributes struct {
+    AgentID           string
+    TargetDomain      string
+    CredentialRefHash string  // Comma-separated placeholder hashes
+    Status            string  // in_progress, success, denied, error
+}
+```
+
+The audit workflow is fired as a goroutine (fire-and-forget) after credential injection succeeds:
+
+```go
+// handlers.go - Fire-and-forget audit
+go func() {
+    wfID := fmt.Sprintf("credproxy-%s-%d", identity.Subject, time.Now().UnixNano())
+    _, err := gw.temporal.ExecuteWorkflow(context.Background(),
+        temporalclient.StartWorkflowOptions{
+            ID:        wfID,
+            TaskQueue: gw.cfg.Temporal.TaskQueue,
+        }, workflows.AuditWorkflow, workflows.ProxyWorkflowInput{
+            AgentID:           identity.Subject,
+            RequestID:         wfID,
+            TargetDomain:      targetDomain,
+            Method:            req.Method,
+            Path:              req.URL.Path,
+            PlaceholderHashes: placeholders,
+        })
+    if err != nil {
+        slog.Error("temporal audit workflow failed", "error", err, "workflow_id", wfID)
+    }
+}()
+```
+
+### Audit Trail Comparison
+
+| Aspect | Peta Core | Credential-Proxy |
+|--------|-----------|------------------|
+| Storage | SQL (PostgreSQL) | Temporal event store |
+| Query interface | SQL indexes (userId, sessionId, createdAt) | Search attributes (AgentID, TargetDomain, Status) |
+| Granularity | Per-event with typed action enum | Per-workflow execution |
+| Secret handling | Token mask (first 8 + last 8 chars) | Only credential placeholder hashes |
+| Response data | Truncated to 300 chars or full if error | Omitted entirely |
+| Write strategy | Batch queue (100 events / 5 sec) | Fire-and-forget goroutine |
+| Immutability | Append-only log table | Temporal event sourcing |
+| Retention | Database (indefinite) | Temporal namespace TTL |
+
+---
+
+## Vault Integration
+
+### Credential-Proxy: OpenBao KV v2
+
+The credential-proxy stores secrets in OpenBao with a structured schema per credential:
+
+```yaml
+# Vault path: secret/data/openclaw/credentials/anthropic
+key: "sk-ant-xxx"
+header_name: "x-api-key"
+header_prefix: "Bearer "
+```
+
+The `SecretStore` interface enables dependency injection for testing:
+
+```go
+// vault/client.go
+type SecretStore interface {
+    FetchCredential(ctx context.Context, vaultPath string) (*CredentialValue, error)
+}
+
+type OpenBaoClient struct {
+    client *baoapi.Client
+}
+
+var _ SecretStore = (*OpenBaoClient)(nil)  // Compile-time interface check
+```
+
+OpenBao handles encryption at rest transparently. The credential-proxy never decrypts the KV v2 envelope directly -- the vault client handles transport and unsealing.
+
+### Peta Core: Application-Level Encryption
+
+Peta Core does not use an external vault. Instead, it implements application-level encryption with AES-256-GCM and stores encrypted blobs in the database `User.encryptedToken` field. The encryption key is derived from the user's authentication secret via PBKDF2.
+
+This approach means the application code is responsible for key management, whereas the credential-proxy delegates this entirely to OpenBao.
+
+---
+
+## Encryption Model
+
+### Peta Core AES-256-GCM Implementation
+
+```typescript
+// CryptoService.ts
+static async encrypt(data: string, key: CryptoKey, salt?: Uint8Array): Promise<EncryptedData> {
+    const iv = this.generateIV();             // 96-bit random IV
+    const usedSalt = salt || this.generateSalt();  // 128-bit random salt
+
+    const encryptedBuffer = await webcrypto.subtle.encrypt({
+        name: "AES-GCM",
+        iv: iv,
+    }, key, dataBuffer);
+
+    // Separate ciphertext from GCM authentication tag (last 16 bytes)
+    const encryptedData = encryptedArray.slice(0, -16);
+    const tag = encryptedArray.slice(-16);
+
+    return {
+        data: btoa(String.fromCharCode.apply(null, Array.from(encryptedData))),
+        iv:   btoa(String.fromCharCode.apply(null, Array.from(iv))),
+        salt: btoa(String.fromCharCode.apply(null, Array.from(usedSalt))),
+        tag:  btoa(String.fromCharCode.apply(null, Array.from(tag))),
+    };
+}
+```
+
+The GCM authentication tag provides integrity verification, preventing tampering with the encrypted data. The salt is stored alongside the ciphertext so the same PBKDF2-derived key can be reconstructed for decryption.
+
+### Credential-Proxy: Vault-Managed Encryption
+
+The credential-proxy has no application-level encryption code. OpenBao manages:
+
+- Encryption at rest (seal/unseal mechanism)
+- Transport security (TLS required for production)
+- Access control (token-based or AppRole authentication)
+- Audit logging (vault-level audit backend)
+
+---
+
+## Security Model Comparison
+
+### Credential-Proxy: Defense in Depth
+
+The threat model assumes a potentially compromised agent attempting credential exfiltration, domain abuse, or secret extraction from responses. Defenses are layered:
+
+1. **Domain allowlisting** (CONNECT phase, fail-closed):
+
+```go
+if !gw.cfg.IsAllowedDomain(domain) {
+    return goproxy.RejectConnect, host
+}
+```
+
+2. **Redirect prevention** (blocks exfiltration via HTTP redirect):
+
+```go
+HTTPClient: &http.Client{
+    CheckRedirect: func(*http.Request, []*http.Request) error {
+        return http.ErrUseLastResponse
+    },
+},
+```
+
+3. **OPA policy enforcement** (deterministic authorization):
+
+```go
+authzResult, err := gw.authz.Evaluate(bgCtx, &authz.AuthzRequest{
+    Identity:     identity.RawClaims,
+    Placeholders: placeholders,
+    TargetDomain: targetDomain,
+    Credentials:  bindings,
+})
+```
+
+4. **Response scrubbing** (prevents credential leakage in responses):
+
+```go
+// sanitizer.go
+func ScrubCredentials(resp *http.Response, credentials map[string]string) error {
+    pairs := make([]string, 0, len(credentials)*2)
+    for realVal, placeholder := range credentials {
+        pairs = append(pairs, realVal, placeholder)
+    }
+    r := strings.NewReplacer(pairs...)
+    scrubbed := r.Replace(string(body))
+    // Reset body with scrubbed content...
+}
+```
+
+5. **Immutable audit trail** (Temporal event sourcing)
+
+### Peta Core: Token and Encryption Security
+
+The threat model focuses on session hijacking, scope elevation, and token reuse. Defenses include:
+
+1. Multi-layer token validation (JWT + database + user status)
+2. Scope binding in JWT payload (immutable after issuance)
+3. PKCE support for authorization code interception prevention
+4. Single-use authorization codes with 10-minute expiration
+5. Token revocation via database flag
+
+### Combined Comparison
+
+| Defense Layer | Credential-Proxy | Peta Core |
+|---------------|-----------------|-----------|
+| Network isolation | VSOCK + domain allowlist | IP whitelisting |
+| Authentication | OIDC (Keycloak) | Self-issued JWT + hashed token lookup |
+| Authorization | OPA policy engine | Scope-based + role-based |
+| Secret storage | OpenBao vault | Application-level AES-256-GCM |
+| Exfiltration prevention | Response scrubbing + redirect blocking | Token masking in logs |
+| Revocation | Not implemented | Database revocation flag |
+| Audit | Temporal workflows | SQL batch logging |
+| HITL approval | Not implemented | OAuth consent screen |
+
+---
+
+## Pattern Summary and Adoption Recommendations
+
+```{r pattern_table, echo=FALSE, eval=TRUE, results='asis'}
+patterns <- data.frame(
+  Pattern = c(
+    "JIT credential fetch with TTL",
+    "Multi-layer token validation",
+    "Dual audit storage (SQL + event store)",
+    "Batch log queue with flush timer",
+    "Session-scoped logger with context",
+    "HITL approval via OAuth consent",
+    "PKCE for code interception prevention",
+    "Token revocation database flag",
+    "Application-level encryption (AES-GCM)",
+    "Response scrubbing",
+    "Domain allowlisting (fail-closed)",
+    "OPA deterministic policy evaluation",
+    "Sealed activities (no secrets in history)"
+  ),
+  Source = c(
+    "Both",
+    "Peta Core",
+    "Peta Core",
+    "Peta Core",
+    "Peta Core",
+    "Peta Core",
+    "Peta Core",
+    "Peta Core",
+    "Peta Core",
+    "Credential-Proxy",
+    "Credential-Proxy",
+    "Credential-Proxy",
+    "Credential-Proxy"
+  ),
+  Priority = c(
+    "High",
+    "Medium",
+    "High",
+    "Medium",
+    "Low",
+    "Medium",
+    "Low",
+    "High",
+    "Low",
+    "Already implemented",
+    "Already implemented",
+    "Already implemented",
+    "Already implemented"
+  ),
+  Recommendation = c(
+    "Add 30-second credential cache TTL with vault refresh",
+    "Add database-backed token validation alongside OIDC",
+    "Add SQL audit log alongside Temporal for compliance and forensics",
+    "Adopt for high-throughput audit scenarios",
+    "Consider for structured proxy request logging",
+    "Implement for sensitive domain access approval",
+    "Not needed (no OAuth code flow in proxy)",
+    "Implement credential and session revocation",
+    "Not needed (vault handles encryption at rest)",
+    "Maintain and extend",
+    "Maintain and extend",
+    "Maintain and extend",
+    "Maintain and extend"
+  ),
+  stringsAsFactors = FALSE
+)
+
+knitr::kable(patterns, format = "html",
+  col.names = c("Pattern", "Source", "Priority", "Recommendation"))
+```
+
+---
+
+## Key Takeaways for credential-proxy
+
+### 1. Add Credential TTL Refresh (High Priority)
+
+Implement a short-lived credential cache with configurable TTL (30 seconds recommended). This limits the window of exposure if the vault is compromised and aligns with the JIT decryption pattern observed in Peta Core.
+
+```go
+type CredentialCache struct {
+    value     *CredentialValue
+    fetchedAt time.Time
+    ttl       time.Duration  // 30 seconds
+}
+
+func (c *CredentialCache) IsExpired(now time.Time) bool {
+    return now.Sub(c.fetchedAt) > c.ttl
+}
+```
+
+### 2. Dual Audit Storage (High Priority)
+
+Add a SQL audit log alongside Temporal for compliance. Temporal has namespace-level TTL, which may not meet long-term retention requirements. A database log enables SQL-based forensic queries that complement Temporal's search attributes.
+
+### 3. Token Revocation (High Priority)
+
+Implement credential and session revocation at the proxy layer. Currently, credentials live until deleted from vault and sessions are only bounded by OIDC token expiration. A revocation mechanism would allow immediate credential lockout without vault intervention.
+
+### 4. HITL Approval for Sensitive Domains (Medium Priority)
+
+For future enhancement, implement an approval workflow for first-time access to sensitive domains. This can follow the OAuth consent screen pattern: issue an approval token with a 5-minute TTL, require human sign-off via external service (Slack, email, webhook), and cache the approval per agent-domain pair.
+
+### 5. Multi-Layer Token Validation (Medium Priority)
+
+Consider adding a proxy-issued session layer on top of OIDC tokens. This would provide proxy-level control independent of the OIDC provider and enable features like session-scoped credential allowlists.
+
+### 6. Maintain Existing Strengths
+
+The credential-proxy already implements several patterns that Peta Core lacks:
+
+- **Response scrubbing** prevents credential leakage in API responses
+- **OPA policy enforcement** provides deterministic, auditable authorization
+- **Sealed Temporal activities** ensure secrets never appear in workflow history
+- **Domain allowlisting** is fail-closed by default
+- **Redirect prevention** blocks exfiltration via HTTP redirects
+
+These should be maintained and extended as the system evolves.

@@ -1,0 +1,884 @@
+---
+title: "Agent Gateway - RBAC and Header Manipulation Pattern Analysis"
+date: "2026-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+## Executive Summary
+
+Agent Gateway (Rust, Linux Foundation) implements a sophisticated, composable policy
+system using CEL (Common Expression Language) for authorization combined with JWT
+authentication, while our credential-proxy (Go) uses a simpler MITM proxy model with
+OPA (Open Policy Agent) for authorization. This report identifies architectural patterns
+from the Agent Gateway codebase that are applicable -- and those that are over-engineered --
+for the credential-proxy's Go implementation.
+
+**Key finding:** Most of Agent Gateway's complexity (multi-issuer JWT, CEL expression
+engine, per-route policy composition, multi-protocol support) is unnecessary for
+credential-proxy. However, several structural patterns around fail-closed authorization,
+header manipulation abstraction, and middleware composition are directly applicable.
+
+
+## RBAC Model
+
+### Agent Gateway: CEL-Based Allow/Deny Rule Sets
+
+Agent Gateway implements resource-based access control through CEL expressions organized
+into allow/deny rule sets. Policies are attached directly to resources (routes, backends)
+rather than to principals.
+
+The core authorization data structure is a `PolicySet` containing separate allow and deny
+expression lists:
+
+```rust
+// crates/agentgateway/src/http/authorization.rs
+
+pub struct HTTPAuthorizationSet(RuleSets);  // Multiple rule sets
+
+pub struct PolicySet {
+    allow: Vec<Arc<cel::Expression>>,
+    deny: Vec<Arc<cel::Expression>>,
+}
+
+pub enum Policy {
+    Allow(Arc<cel::Expression>),
+    Deny(Arc<cel::Expression>),
+}
+```
+
+The evaluation logic follows a strict precedence order -- DENY wins over ALLOW, and the
+default is DENY (fail-closed):
+
+```rust
+impl RuleSets {
+    pub fn validate(&self, exec: &Executor) -> bool {
+        let has_rules = rule_sets.iter().any(|r| r.has_rules());
+        // If there are no rule sets, everyone has access
+        if !has_rules {
+            return true;
+        }
+        // If there are any DENY, deny
+        if rule_sets.iter().any(|r| r.denies(exec)) {
+            return false;
+        }
+        // If there are any ALLOW, allow
+        if rule_sets.iter().any(|r| r.allows(exec)) {
+            return true;
+        }
+        // Else deny
+        false
+    }
+}
+```
+
+Per-request evaluation creates a CEL `Executor` from the HTTP request, enabling policies
+to inspect headers, method, path, JWT claims, and source IP:
+
+```rust
+impl HTTPAuthorizationSet {
+    pub fn apply(&self, req: &http::Request) -> anyhow::Result<()> {
+        let exec = cel::Executor::new_request(req);
+        let allowed = self.0.validate(&exec);
+        if !allowed {
+            anyhow::bail!("HTTP authorization denied");
+        }
+        Ok(())
+    }
+}
+```
+
+### Credential-Proxy: OPA-Based Linear Pipeline
+
+Our credential-proxy uses a simpler model: OIDC identity verification feeds into OPA
+policy evaluation. The OPA input model is purpose-built for our domain:
+
+```go
+// credential-proxy/authz/engine.go
+
+type AuthzRequest struct {
+    Identity       map[string]interface{}  // JWT claims
+    Placeholders   []string                // Found tokens
+    TargetDomain   string                  // Request destination
+    Credentials    []CredentialBinding     // Resolved configs
+}
+```
+
+**Analysis:** Agent Gateway's per-resource CEL rule sets support arbitrary RBAC hierarchies
+and fine-grained claim inspection. Credential-proxy only needs: identity validation,
+placeholder extraction, and OPA policy evaluation. The CEL approach is over-engineered
+for our use case, but the fail-closed evaluation precedence (DENY > ALLOW > default DENY)
+is a pattern worth preserving.
+
+
+## JWT Integration
+
+### Agent Gateway: Multi-Issuer with Mode Selection
+
+Agent Gateway supports multiple OIDC providers simultaneously, with three validation modes:
+
+```rust
+// crates/agentgateway/src/http/jwt.rs
+
+pub enum LocalJwtConfig {
+    Multi {
+        mode: Mode,
+        providers: Vec<ProviderConfig>,  // Multi-issuer support
+    },
+    Single { issuer, audiences, jwks }
+}
+
+pub enum Mode {
+    Strict,       // Token required
+    Optional,     // Validated if present
+    Permissive,   // Never rejected
+}
+```
+
+JWT verification follows a multi-step process:
+
+1. Extract bearer token from `Authorization: Bearer <token>`
+2. Decode header to get `kid` (key ID)
+3. Look up key in JWKS by `kid` across all configured providers
+4. Validate signature + issuer + audience
+5. Remove Authorization header before upstream forwarding
+6. Store claims in request extensions for downstream policy evaluation
+
+```rust
+impl Jwt {
+    pub async fn apply(&self, log: Option<&mut RequestLog>, req: &mut Request)
+        -> Result<(), TokenError>
+    {
+        // Extract bearer token
+        let Ok(TypedHeader(Authorization(bearer))) = req
+            .extract_parts::<TypedHeader<Authorization<Bearer>>>()
+            .await
+        else {
+            if self.mode == Mode::Strict {
+                return Err(TokenError::Missing);
+            }
+            return Ok(());
+        };
+        let claims = match self.validate_claims(bearer.token()) {
+            Ok(claims) => claims,
+            Err(e) if self.mode == Mode::Permissive => {
+                return Ok(());
+            },
+            Err(e) => return Err(e),
+        };
+        // Remove the token before forwarding
+        req.headers_mut().remove(http::header::AUTHORIZATION);
+        // Store claims for downstream use
+        req.extensions_mut().insert(claims);
+        Ok(())
+    }
+}
+```
+
+Claims are stored as a dynamic type that integrates with the CEL expression engine:
+
+```rust
+pub struct Claims {
+    pub inner: Map<String, Value>,    // Full claim set
+    pub jwt: SecretString,            // Raw JWT stored for passthrough
+}
+
+impl DynamicType for Claims {
+    fn field(&self, field: &str) -> Option<cel::Value<'_>> {
+        self.inner.field(field)
+    }
+}
+```
+
+Algorithm support includes RS256, RS384, RS512, ES256, and ES384, with automatic
+inference from key type when not explicitly configured.
+
+### Credential-Proxy: Single OIDC Issuer via go-oidc
+
+Our credential-proxy uses the `coreos/go-oidc` library with auto-discovery from a single
+Keycloak issuer:
+
+```go
+// credential-proxy/authn/authn.go
+
+type AgentIdentity struct {
+    Subject    string                   // JWT "sub" claim
+    Roles      []string                 // realm_access.roles (Keycloak)
+    Groups     []string                 // groups claim
+    RawClaims  map[string]interface{}   // Full claims for OPA
+}
+
+type OIDCVerifier struct {
+    verifier *gooidc.IDTokenVerifier
+}
+```
+
+Verification flow:
+
+1. Extract bearer from `Proxy-Authorization` header
+2. Use `go-oidc` auto-discovery (resolves JWKS endpoint from issuer URL)
+3. Validate against single issuer + audience
+4. Extract identity with Keycloak-specific claim paths
+
+**Analysis:** Multi-issuer JWT is unnecessary -- credential-proxy targets a single Keycloak
+instance. The JWKS auto-discovery via `go-oidc` eliminates manual key management that Agent
+Gateway requires. However, the three-mode approach (Strict/Optional/Permissive) is worth
+noting for future flexibility.
+
+**Gap:** Hard-coded Keycloak assumptions (`realm_access.roles`). If we ever support
+non-Keycloak OIDC issuers, the claims extraction would need abstracting.
+
+
+## Header Manipulation
+
+### Agent Gateway: Layered Abstraction with CEL Expressions
+
+Agent Gateway provides three distinct header manipulation mechanisms, each at a different
+abstraction level:
+
+**1. Static Header Modifier** (simple add/set/remove):
+
+```rust
+// crates/agentgateway/src/http/filters.rs
+
+pub struct HeaderModifier {
+    pub add: Vec<(Strng, Strng)>,      // Append header
+    pub set: Vec<(Strng, Strng)>,      // Set/replace header
+    pub remove: Vec<Strng>,            // Delete header
+}
+
+impl HeaderModifier {
+    pub fn apply(&self, headers: &mut HeaderMap<HeaderValue>) -> Result<(), Error> {
+        for (k, v) in &self.add {
+            headers.append(HeaderName::from_bytes(k.as_bytes())?, v.parse()?);
+        }
+        for (k, v) in &self.set {
+            headers.insert(HeaderName::from_bytes(k.as_bytes())?, v.parse()?);
+        }
+        for k in &self.remove {
+            headers.remove(HeaderName::from_bytes(k.as_bytes())?);
+        }
+        Ok(())
+    }
+}
+```
+
+**2. CEL-based Transformation** (dynamic header values computed at request time):
+
+```rust
+// crates/agentgateway/src/http/transformation_cel.rs
+
+pub struct LocalTransform {
+    pub add: Vec<(Strng, Strng)>,      // Values are CEL expressions
+    pub set: Vec<(Strng, Strng)>,      // Values are CEL expressions
+    pub remove: Vec<Strng>,
+    pub body: Option<Strng>,           // Body transformation via CEL
+}
+```
+
+Example YAML configuration:
+
+```yaml
+transformation:
+  request:
+    add:
+      x-user-id: jwt.claims.sub
+      x-timestamp: now.unix_seconds
+```
+
+**3. Pseudo-Header Manipulation** (HTTP/2-aware):
+
+```rust
+// crates/agentgateway/src/http/mod.rs
+
+pub enum HeaderOrPseudo {
+    Header(HeaderName),
+    Method,          // :method pseudo-header
+    Scheme,          // :scheme
+    Authority,       // :authority
+    Path,            // :path
+    Status,          // :status
+}
+
+pub enum RequestOrResponse<'a> {
+    Request(&'a mut Request),
+    Response(&'a mut Response),
+}
+
+impl RequestOrResponse<'_> {
+    pub fn apply_header(
+        &mut self,
+        k: &HeaderOrPseudo,
+        v: Option<HeaderOrPseudoValue>,
+        append: bool,
+    ) { /* ... */ }
+}
+```
+
+### Agent Gateway: Backend Auth Injection
+
+After authorization passes, backend-specific credential injection is performed:
+
+```rust
+// crates/agentgateway/src/http/auth.rs
+
+pub enum BackendAuth {
+    Passthrough {},    // Re-inject original JWT
+    Key(SecretString), // Static API key as Bearer
+    Gcp(GcpAuth),      // Fetch GCP service account token
+    Aws(AwsAuth),      // AWS SigV4 request signing
+    Azure(AzureAuth),  // Azure managed identity token
+}
+
+pub async fn apply_backend_auth(
+    backend_info: &BackendInfo,
+    auth: &BackendAuth,
+    req: &mut Request,
+) -> Result<(), ProxyError> {
+    match auth {
+        BackendAuth::Passthrough {} => {
+            // Re-inject JWT that was stripped during auth
+            if let Some(claim) = req.extensions().get::<Claims>() {
+                let token = format!("Bearer {}", claim.jwt.expose_secret());
+                req.headers_mut().insert(AUTHORIZATION, token.parse()?);
+            }
+        },
+        BackendAuth::Key(k) => {
+            let token = format!("Bearer {}", k.expose_secret());
+            req.headers_mut().insert(AUTHORIZATION, token.parse()?);
+        },
+        BackendAuth::Gcp(g) => {
+            gcp::insert_token(g, &backend_info.call_target, req.headers_mut()).await?;
+        },
+        // AWS handled in apply_late_backend_auth (signing must come last)
+        BackendAuth::Aws(_) => {},
+        BackendAuth::Azure(azure_auth) => {
+            let token = azure::get_token(&backend_info.inputs.upstream, azure_auth).await?;
+            req.headers_mut().insert(AUTHORIZATION, token);
+        },
+    }
+    Ok(())
+}
+```
+
+### Credential-Proxy: Placeholder Extraction and Replacement
+
+Our credential-proxy uses a different model -- regex-based placeholder extraction followed
+by single-pass string replacement:
+
+```go
+// credential-proxy/proxy/placeholder.go
+
+var placeholderPattern = regexp.MustCompile(
+    `agent-vault-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`,
+)
+
+func Extract(req *http.Request) ([]string, error) {
+    seen := make(map[string]struct{})
+    // Scan headers, query params, body
+    // ...
+    return out, nil
+}
+
+func ReplaceInRequest(req *http.Request, replacements map[string]string) error {
+    // Build strings.NewReplacer for single-pass replacement
+    // (prevents double-substitution)
+    pairs := make([]string, 0, len(replacements)*2)
+    for placeholder, real := range replacements {
+        pairs = append(pairs, placeholder, real)
+    }
+    r := strings.NewReplacer(pairs...)
+    // Replace in headers, query params, body
+    // ...
+}
+```
+
+**Analysis:** Agent Gateway's CEL-based transformations and pseudo-header manipulation are
+unnecessary for credential-proxy. Our placeholder extraction + literal replacement pattern
+is simpler, more predictable, and prevents double-substitution. The `BackendAuth` enum is
+interesting but over-engineered -- all our credentials come from Vault and are injected as
+headers.
+
+
+## Middleware Composition
+
+### Agent Gateway: Hierarchical Policy Layers
+
+Agent Gateway applies policies at multiple composition levels:
+
+```
+Global Config (frontend policies)
+    |
+    v
+Bind (port-level)
+    |
+    v
+Listener (hostname-level)
+    |
+    v
+Route Match (path/method/header/query)
+    |
+    v
+Route Policies (inline_policies on Route)
+    |
+    v
+Backend Selection
+    |
+    v
+Backend Policies (inline_policies on Backend)
+    |
+    v
+Backend Target Auth (BackendAuth enum)
+```
+
+The policy type system is a comprehensive enum:
+
+```rust
+// crates/agentgateway/src/types/agent.rs
+
+pub enum TrafficPolicy {
+    Timeout(timeout::Policy),
+    Retry(retry::Policy),
+    AI(Arc<llm::Policy>),
+    Authorization(Authorization),
+    LocalRateLimit(Vec<localratelimit::RateLimit>),
+    RemoteRateLimit(remoteratelimit::RemoteRateLimit),
+    ExtAuthz(ext_authz::ExtAuthz),
+    ExtProc(ext_proc::ExtProc),
+    JwtAuth(jwt::Jwt),
+    BasicAuth(basicauth::BasicAuthentication),
+    APIKey(apikey::APIKeyAuthentication),
+    Transformation(transformation_cel::Transformation),
+    Csrf(csrf::Csrf),
+    RequestHeaderModifier(filters::HeaderModifier),
+    ResponseHeaderModifier(filters::HeaderModifier),
+    RequestRedirect(filters::RequestRedirect),
+    UrlRewrite(filters::UrlRewrite),
+    HostRewrite(agent::HostRedirectOverride),
+    RequestMirror(Vec<filters::RequestMirror>),
+    DirectResponse(filters::DirectResponse),
+    CORS(http::cors::Cors),
+}
+```
+
+### Credential-Proxy: Linear Pipeline
+
+Our credential-proxy follows a linear pipeline with no routing abstraction:
+
+```
+HTTP Request
+    | (goproxy CONNECT handler)
+handleConnect()
+    - Validate domain against allowlist
+    - Extract token from Proxy-Authorization
+    - Store in connTokens map
+    | (goproxy OnRequest handler)
+handleRequest()
+    - Retrieve token
+    - Verify JWT (OIDC)
+    - Extract placeholders
+    - Evaluate OPA policy
+    - Fetch credentials from vault
+    - Replace placeholders
+    | (goproxy OnResponse handler)
+handleResponse()
+    - Scrub real credentials
+    - Clean up connTokens
+```
+
+**Analysis:** Agent Gateway's hierarchical composition is designed for a multi-tenant
+gateway serving diverse backends. Credential-proxy operates as a single-purpose MITM proxy
+where all requests follow the same pipeline. The linear model is appropriate, but
+refactoring to a middleware chain would improve testability.
+
+**Recommended enhancement** -- middleware chain for testability:
+
+```go
+type RequestHandler interface {
+    Handle(ctx *RequestContext) error
+}
+
+type RequestContext struct {
+    Request      *http.Request
+    Token        string
+    Identity     *AgentIdentity
+    Placeholders []string
+    Credentials  map[string]string
+}
+
+var handlers = []RequestHandler{
+    &TokenExtractor{},
+    &JWTVerifier{},
+    &PlaceholderExtractor{},
+    &AuthzEvaluator{},
+    &CredentialResolver{},
+    &CredentialInjector{},
+}
+```
+
+
+## Per-Route Policies
+
+### Agent Gateway: Inline Policies on Routes and Backends
+
+Agent Gateway attaches policies directly to route and backend definitions:
+
+```rust
+// crates/agentgateway/src/types/agent.rs
+
+pub struct Route {
+    pub key: RouteKey,
+    pub name: RouteName,
+    pub hostnames: Vec<Strng>,
+    pub matches: Vec<RouteMatch>,
+    pub backends: Vec<RouteBackendReference>,
+    pub inline_policies: Vec<TrafficPolicy>,  // Route-level policies
+}
+
+pub struct RouteBackendReference {
+    pub weight: f32,
+    pub backend: BackendReference,
+    pub inline_policies: Vec<BackendPolicy>,  // Per-backend policies
+}
+```
+
+Example configuration with per-route authorization:
+
+```yaml
+listeners:
+- routes:
+  - name: admin
+    matches:
+    - path:
+        pathExact: /admin
+    policies:
+      authorization:
+        rules:
+        - 'jwt.claims.role == "admin"'
+      timeout: 5s
+      requestHeaderModifier:
+        add:
+          x-route: admin-panel
+    backends:
+    - host: admin.internal:8080
+      policies:
+        backendAuth:
+          gcp:
+            type: idToken
+            audience: admin.internal
+```
+
+Route selection follows a priority order:
+
+1. "Exact" path match
+2. "Prefix" path match with largest number of characters
+3. Method match
+4. Largest number of header matches
+5. Largest number of query param matches
+6. Tiebreaker: oldest route + alphabetical namespace/name
+
+### Credential-Proxy: No Per-Route Differentiation
+
+Credential-proxy currently applies the same OPA policy to all proxied requests. This is
+sufficient for the current use case but limits future flexibility.
+
+**Potential enhancement** (optional, not currently required):
+
+```yaml
+routes:
+- path: /anthropic
+  opa_policy_override: policy_anthropic.rego
+  backends:
+  - domain: api.anthropic.com
+
+- path: /openai
+  # Falls back to default OPA policy (no override)
+  backends:
+  - domain: api.openai.com
+```
+
+
+## MCP/A2A Architecture
+
+### Agent Gateway: Multi-Protocol Routing
+
+Agent Gateway supports multiple agent communication protocols:
+
+- **MCP** (Model Context Protocol): stdio or HTTP transport
+- **HTTP**: Generic HTTP proxy with full policy support
+- **A2A** (Agent-to-Agent): JSON-RPC over HTTP
+- **TCP**: Raw TCP passthrough
+- **HBONE**: Ambient mesh protocol (Istio-style mTLS)
+
+Each protocol has dedicated backend policy variants:
+
+```rust
+pub enum BackendPolicy {
+    McpAuthorization(McpAuthorization),   // MCP-specific RBAC
+    McpAuthentication(McpAuthentication), // MCP-specific authN
+    A2a(A2aPolicy),                       // A2A-specific handling
+    HTTP(backend::HTTP),
+    TCP(backend::TCP),
+    BackendTLS(BackendTLS),
+    BackendAuth(BackendAuth),
+    InferenceRouting(ext_proc::InferenceRouting),
+    AI(Arc<llm::Policy>),
+    SessionPersistence(sessionpersistence::Policy),
+    RequestHeaderModifier(filters::HeaderModifier),
+    ResponseHeaderModifier(filters::HeaderModifier),
+    RequestRedirect(filters::RequestRedirect),
+    RequestMirror(Vec<filters::RequestMirror>),
+}
+```
+
+MCP authorization uses a Cedar-like policy language built on CEL:
+
+```yaml
+mcpAuthorization:
+  rules:
+  # Allow anyone to call 'echo'
+  - 'permit(principal, action == Action::"call_tool", resource == Tool::"echo");'
+  # Only test-user can call 'add'
+  - 'permit(principal == User::"test-user", action == Action::"call_tool",
+     resource == Tool::"add");'
+  # Claim-based access
+  - |
+    permit(principal is User, action == Action::"call_tool",
+    resource == Tool::"printEnv") when
+    { context.claims.nested.key == "value" };
+```
+
+Resource metadata follows RFC 8707:
+
+```json
+{
+  "resource": "mcp://gateway/server/everything",
+  "authorization_servers": ["https://keycloak/realms/openclaw"],
+  "mcp_protocol_version": "2025-06-18",
+  "resource_type": "mcp-server"
+}
+```
+
+### Credential-Proxy Scope
+
+Credential-proxy is HTTP-only (MITM HTTPS). Multi-protocol routing is out of scope, but
+the protocol-level separation pattern is instructive: Agent Gateway cleanly separates
+protocol-specific policies from generic HTTP policies.
+
+
+## CEL Authorization Engine
+
+### Architecture
+
+Agent Gateway uses CEL (Common Expression Language, designed by Google) as its core
+authorization expression engine. CEL is purpose-built for lightweight, fast policy
+evaluation.
+
+```rust
+// crates/agentgateway/src/cel/mod.rs
+
+pub struct Expression {
+    attributes: FlagSet<Attributes>,
+    expression: Program,           // Compiled CEL program
+    original_expression: String,
+}
+
+flagset::flags! {
+    enum Attributes: u16 {
+        Source,
+        Request,
+        RequestBody,
+        Response,
+        // ...
+    }
+}
+```
+
+Expressions are compiled at configuration load time and evaluated against request context:
+
+```rust
+pub fn apply(&self, req: &http::Request) -> anyhow::Result<()> {
+    let exec = cel::Executor::new_request(req);
+    let allowed = self.0.validate(&exec);
+    if !allowed {
+        anyhow::bail!("HTTP authorization denied");
+    }
+    Ok(())
+}
+```
+
+### CEL vs OPA/Rego Trade-offs
+
+| Dimension | CEL | OPA/Rego |
+|-----------|-----|----------|
+| **Purpose** | Lightweight authz expressions | Full policy language |
+| **Complexity** | Simple, single-expression | Modules, imports, complex logic |
+| **Performance** | Faster evaluation | Heavier runtime |
+| **Ecosystem** | Google APIs, Kubernetes, CEL Policy | Cloud security, Kubernetes admission |
+| **Debugging** | Straightforward | More tooling available |
+| **Flexibility** | Limited to expression evaluation | Supports data joins, aggregations |
+
+**For credential-proxy:** OPA/Rego is the right choice. Our authorization requires
+evaluating multiple inputs (identity, placeholders, domain, credential bindings) against
+policies that may include complex logic. CEL would require splitting this across many
+small expressions.
+
+
+## Summary of Patterns and Adoption Recommendations
+
+```{r patterns-table, echo=FALSE, eval=TRUE, results='asis'}
+patterns <- data.frame(
+  Aspect = c(
+    "RBAC Model",
+    "JWT Validation",
+    "Header Manipulation",
+    "Middleware Composition",
+    "Per-Route Policies",
+    "Credential Types",
+    "Audit Trail",
+    "Error Handling",
+    "Fail-Closed Default",
+    "Request Snapshotting"
+  ),
+  `Current State` = c(
+    "OPA + simple pipeline",
+    "Single OIDC issuer (Keycloak)",
+    "Placeholder extraction + replacement",
+    "Monolithic handleRequest",
+    "Global OPA policy for all routes",
+    "String-based enum",
+    "Fire-and-forget Temporal workflow",
+    "Return HTTP 403 on authz deny",
+    "OPA denies by default",
+    "Read body once, reset"
+  ),
+  `Agent Gateway Pattern` = c(
+    "CEL + per-route policies",
+    "Multi-issuer with Strict/Optional/Permissive modes",
+    "CEL-based dynamic transformation + pseudo-headers",
+    "Hierarchical: global > listener > route > backend",
+    "Per-route inline_policies",
+    "Type-safe enum with BackendAuth variants",
+    "Structured request logging",
+    "Structured error context with deny reasons",
+    "DENY > ALLOW > default DENY",
+    "CEL-based snapshots for before/after comparison"
+  ),
+  Recommendation = c(
+    "Keep OPA; consider optional per-route policy overrides",
+    "Keep single issuer; abstract claims extraction for future",
+    "Keep placeholder pattern; add config-driven header mapping",
+    "Refactor into handler chain for independent testability",
+    "Add optional route-level OPA policy override",
+    "Use Go iota-based enums with methods",
+    "Formalize AuditRecord struct with redaction support",
+    "Include deny reason in structured response for debugging",
+    "Already correct; maintain",
+    "Already correct for our use case"
+  ),
+  Priority = c(
+    "Low",
+    "Low",
+    "Low",
+    "Medium",
+    "Low",
+    "Medium",
+    "Medium",
+    "Low",
+    "N/A (done)",
+    "N/A (done)"
+  ),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+knitr::kable(patterns, format = "html", escape = FALSE,
+             caption = "Agent Gateway Patterns: Applicability to Credential-Proxy")
+```
+
+
+## Key Takeaways for Credential-Proxy
+
+### What to Adopt
+
+1. **Middleware chain refactoring.** The current monolithic `handleRequest` function should
+   be decomposed into independently testable handler stages. Each handler (token extraction,
+   JWT verification, placeholder extraction, OPA evaluation, credential resolution,
+   credential injection) becomes a unit-testable component.
+
+2. **Structured audit records.** Formalize the audit trail as a typed struct with explicit
+   redaction support. No real credentials should appear in audit records -- only placeholder
+   hashes and domain names.
+
+3. **Strongly-typed credential configuration.** Replace the string-based `CredentialType`
+   with Go `iota`-based enums that carry methods (e.g., `HeaderPrefix()` returning the
+   correct prefix for each type).
+
+### What to Skip
+
+1. **CEL expression engine.** OPA/Rego is already sufficient and more appropriate for our
+   centralized policy evaluation model.
+
+2. **Multi-issuer JWT support.** We target a single Keycloak instance. The `go-oidc`
+   auto-discovery pattern is simpler and eliminates manual JWKS management.
+
+3. **Per-route policy composition.** All requests currently follow the same authorization
+   pipeline. Adding per-route overrides is a marginal enhancement, not a current requirement.
+
+4. **Pseudo-header manipulation.** Credential-proxy does not manipulate HTTP methods,
+   schemes, or authority -- only standard headers and body content.
+
+5. **Multi-protocol support.** Credential-proxy is a single-purpose HTTPS MITM proxy, not
+   a multi-protocol gateway.
+
+6. **External authorization services.** OPA is embedded in-process. No need for external
+   gRPC or HTTP authorization callouts.
+
+### Minimal Implementation Path
+
+If credential-proxy needs only marginal improvement, three changes yield the highest
+return:
+
+1. **Add per-route OPA policy override** (~5 lines of configuration code)
+2. **Formalize AuditRecord struct** (~3 structs, ~50 lines)
+3. **Use Go iota enums for CredentialType** (~10 lines of refactoring)
+
+Total impact: approximately 65 lines of code, all backward compatible.
+
+### Architectural Invariants (Shared with Agent Gateway)
+
+These design principles are confirmed by both codebases and should be maintained:
+
+- **Fail-closed by default:** No rules means deny. Missing credentials means deny. Policy
+  evaluation error means deny.
+- **Separation of concerns:** Authentication (who), Authorization (what), Credential
+  Injection (how) are distinct phases.
+- **Immutable request context:** Capture claims/identity once, reuse throughout the
+  pipeline.
+- **Audit-first design:** Log decisions, not secrets.
+- **Composability:** Policies should be independently testable units.
+- **Async audit:** Non-blocking audit workflows to avoid request latency impact.
+- **Credential scrubbing:** Real credentials must never appear in logs, errors, or
+  responses.
+
+
+## Source File References
+
+| Component | File |
+|-----------|------|
+| Agent Gateway Authorization | `agentgateway/crates/agentgateway/src/http/authorization.rs` |
+| Agent Gateway JWT | `agentgateway/crates/agentgateway/src/http/jwt.rs` |
+| Agent Gateway Filters (Headers) | `agentgateway/crates/agentgateway/src/http/filters.rs` |
+| Agent Gateway Routes | `agentgateway/crates/agentgateway/src/http/route.rs` |
+| Agent Gateway Backend Auth | `agentgateway/crates/agentgateway/src/http/auth.rs` |
+| Agent Gateway CEL Engine | `agentgateway/crates/agentgateway/src/cel/mod.rs` |
+| Agent Gateway Types | `agentgateway/crates/agentgateway/src/types/agent.rs` |
+| Agent Gateway Transformations | `agentgateway/crates/agentgateway/src/http/transformation_cel.rs` |
+| Credential-Proxy Config | `credential-proxy/config/config.go` |
+| Credential-Proxy AuthN | `credential-proxy/authn/authn.go` |
+| Credential-Proxy AuthZ | `credential-proxy/authz/engine.go` |
+| Credential-Proxy Placeholders | `credential-proxy/proxy/placeholder.go` |
+| Credential-Proxy Main | `credential-proxy/main.go` |

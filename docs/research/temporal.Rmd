@@ -1,0 +1,926 @@
+---
+title: "Temporal Architecture Research for credential-proxy"
+date: "2026-02-17"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Overview
+
+This document presents research findings from exploring the Temporal server codebase
+(`temporal/temporal` at HEAD) to inform architectural decisions for the `credential-proxy`
+project. The credential-proxy is a Go MITM forward proxy running inside a NixOS VM that
+fires async Temporal audit workflows for every proxied request, using search attributes
+for forensic queryability.
+
+The research covers ten focus areas, each grounded in actual server source code rather
+than documentation alone. Paths referenced below are relative to the Temporal server
+repository root unless otherwise noted.
+
+# Workflow vs Activity
+
+## Determinism Requirements for Workflows
+
+Temporal workflows must be **deterministic**. The server implements event-sourced
+replay: when a worker picks up a Workflow Task, it receives the full event history
+and replays the workflow function from the beginning, skipping completed activities
+by matching their recorded results.
+
+From `docs/architecture/README.md`:
+
+> Workflow code must be deterministic and have no side effects (with specific
+> exceptions), and activity code must either be idempotent or non-retryable
+> (i.e. at least once or at most once).
+
+**What this means concretely for Go workflows:**
+
+- No `time.Now()` -- use `workflow.Now(ctx)` (the credential-proxy already does this correctly)
+- No `rand` -- use `workflow.SideEffect()` or deterministic seeds
+- No goroutines -- use `workflow.Go()`
+- No mutexes -- use `workflow.Mutex`
+- No network/file I/O -- all side effects go in activities
+- No global mutable state
+- The workflow function must produce the same sequence of commands given the same history
+
+## Activity Isolation
+
+Activities are the **side-effect boundary**. They execute exactly once per attempt
+(though they may be retried on failure), and their inputs/outputs are serialized
+into the event history.
+
+From the History Service architecture (`docs/architecture/history-service.md`), when
+a workflow issues a `ScheduleActivityTask` command, the following events are appended:
+
+```
+WorkflowTaskCompleted -> ActivityTaskScheduled -> ActivityTaskStarted -> ActivityTaskCompleted
+```
+
+Each of these events carries serialized payloads that become part of the permanent
+workflow history.
+
+## Local Activities vs Regular Activities
+
+**Regular activities:**
+
+- Scheduled via the Matching Service (Transfer Task -> Matching -> Activity Task)
+- Appear in event history as `ActivityTaskScheduled`, `ActivityTaskStarted`, `ActivityTaskCompleted`
+- Routed through task queues, can be picked up by any worker polling that queue
+- Full retry semantics with server-managed backoff timers
+
+**Local activities:**
+
+- Execute in the same worker process as the workflow, bypassing the Matching Service
+- Do NOT generate individual `ActivityTaskScheduled`/`Started`/`Completed` events
+- Instead, their results are batched into the `WorkflowTaskCompleted` event
+- Lower latency (no round-trip through Matching), but no task routing flexibility
+- Retries are handled locally by the worker, not by the server's Timer Task queue
+
+From `service/history/historybuilder/history_builder_test.go`, local activity
+metering metadata is tracked via `NonfirstLocalActivityExecutionAttempts`.
+
+### Recommendation for credential-proxy
+
+The current design correctly uses **regular activities** for both `ValidateAndResolve`
+and `FetchAndForward`. This is the right choice because:
+
+1. Regular activities give full auditability -- each step appears in event history
+2. The `FetchAndForward` activity involves network I/O (vault + upstream API) which
+   benefits from server-managed retry timers
+3. If the worker crashes mid-activity, the server can reassign the task
+
+However, for the lightweight `AuditWorkflow` (which has zero activities and only
+upserts search attributes), there is no benefit from activities at all. This is
+a correct design -- the workflow itself is sufficient.
+
+# Event History
+
+## What Gets Persisted
+
+Every workflow execution maintains a linear sequence of History Events. From
+`docs/architecture/history-service.md`:
+
+> History Events are a publicly-exposed part of Temporal's internal event-sourcing
+> implementation, and have the property that the sequence of History Events alone,
+> for some Workflow Execution, is sufficient to recover all other relevant information
+> about the workflow execution's state.
+
+The complete set of event types is defined in `temporal/api/enums/v1/event_type.proto`.
+For the credential-proxy's workflow, a typical event sequence is:
+
+```
+1. WorkflowExecutionStarted    -- contains: workflow input (ProxyWorkflowInput)
+2. WorkflowTaskScheduled
+3. WorkflowTaskStarted
+4. WorkflowTaskCompleted       -- contains: UpsertSearchAttributes command
+5. ActivityTaskScheduled       -- contains: activity input (ValidateAndResolveInput)
+6. ActivityTaskStarted
+7. ActivityTaskCompleted       -- contains: activity output (ValidateAndResolveOutput)
+8. WorkflowTaskScheduled
+9. WorkflowTaskStarted
+10. WorkflowTaskCompleted
+11. ActivityTaskScheduled      -- contains: activity input (FetchAndForwardInput)
+12. ActivityTaskStarted
+13. ActivityTaskCompleted      -- contains: activity output (FetchAndForwardOutput)
+14. WorkflowTaskScheduled
+15. WorkflowTaskStarted
+16. WorkflowTaskCompleted      -- contains: final UpsertSearchAttributes
+17. WorkflowExecutionCompleted -- contains: workflow output (ProxyWorkflowOutput)
+```
+
+## What Appears in Event Payloads
+
+**Critical security implication:** Every activity input and output is serialized
+(typically as JSON via the default data converter) and stored in the event history.
+This means:
+
+- `ProxyWorkflowInput` fields appear in `WorkflowExecutionStarted`
+- `ValidateAndResolveInput` appears in `ActivityTaskScheduled` (event 5)
+- `ValidateAndResolveOutput` (with `CredentialPaths` -- vault paths, NOT secrets) appears
+  in `ActivityTaskCompleted` (event 7)
+- `FetchAndForwardInput` (with `CredentialPaths`) appears in `ActivityTaskScheduled` (event 11)
+- `FetchAndForwardOutput` (with `StatusCode`, `BytesTransferred`) appears in
+  `ActivityTaskCompleted` (event 13)
+
+The credential-proxy's current design correctly ensures that **actual secret values
+never appear in any of these payloads**. Vault paths (e.g., `secret/data/openclaw/credentials/anthropic`)
+are safe to store -- they are references, not secrets. Secrets only exist in
+activity-local memory during `FetchAndForward` execution.
+
+### Search Attributes in Events
+
+From `common/searchattribute/event_gen.go`, search attributes are embedded in specific
+event types:
+
+```go
+// Events that carry SearchAttributes:
+// - WorkflowExecutionStartedEventAttributes
+// - UpsertWorkflowSearchAttributesEventAttributes
+// - WorkflowExecutionContinuedAsNewEventAttributes
+// - StartChildWorkflowExecutionInitiatedEventAttributes
+```
+
+The `UpsertWorkflowSearchAttributes` event records the search attribute values
+at the time of upsert. These are indexed for visibility queries.
+
+### Recommendation for credential-proxy
+
+The current approach of passing only hashes and metadata (never secrets) through
+workflow/activity inputs is correct and must be maintained. The event history is
+effectively a permanent, queryable audit log. Some specific guidance:
+
+- **Never pass**: raw API keys, tokens, passwords, or any secret material
+- **Safe to pass**: placeholder hashes, vault paths, domain names, agent IDs,
+  HTTP methods, URL paths, status codes, byte counts
+- **Consider**: whether vault paths themselves reveal sensitive information
+  in your threat model (they reveal what secrets an agent accessed, which is
+  actually valuable audit data)
+
+# Search Attributes
+
+## Architecture
+
+Search attributes are stored in two tiers:
+
+1. **System search attributes** (`common/searchattribute/sadefs/constants.go`): Built-in,
+   always available. Includes `WorkflowId`, `RunId`, `WorkflowType`, `StartTime`,
+   `CloseTime`, `ExecutionStatus`, `TaskQueue`, `HistoryLength`, etc.
+
+2. **Custom search attributes**: User-defined via the operator API. Stored in cluster
+   metadata. These are what the credential-proxy uses.
+
+## Type System
+
+From `common/searchattribute/sadefs/constants.go`, the supported indexed value types are:
+
+| Type | Go constant | Use case |
+|------|-------------|----------|
+| `Keyword` | `INDEXED_VALUE_TYPE_KEYWORD` | Exact match strings |
+| `KeywordList` | `INDEXED_VALUE_TYPE_KEYWORD_LIST` | Lists of exact match strings |
+| `Text` | `INDEXED_VALUE_TYPE_TEXT` | Full-text search strings |
+| `Int` | `INDEXED_VALUE_TYPE_INT` | Integer values |
+| `Double` | `INDEXED_VALUE_TYPE_DOUBLE` | Float values |
+| `Bool` | `INDEXED_VALUE_TYPE_BOOL` | Boolean values |
+| `Datetime` | `INDEXED_VALUE_TYPE_DATETIME` | Timestamp values |
+
+## Registration
+
+Custom search attributes are registered via the Operator API
+(`service/frontend/operator_handler.go`):
+
+```go
+func (h *OperatorHandlerImpl) AddSearchAttributes(
+    ctx context.Context,
+    request *operatorservice.AddSearchAttributesRequest,
+) (*operatorservice.AddSearchAttributesResponse, error)
+```
+
+For SQL-backed visibility (including SQLite in the dev server), the implementation
+allocates pre-defined columns (e.g., `Keyword01` through `Keyword10`) and creates
+aliases mapping custom names to these columns. From `sadefs/constants.go`:
+
+```go
+defaultNumDBCustomSearchAttributes = map[enumspb.IndexedValueType]int{
+    INDEXED_VALUE_TYPE_BOOL:         3,
+    INDEXED_VALUE_TYPE_INT:          3,
+    INDEXED_VALUE_TYPE_DOUBLE:       3,
+    INDEXED_VALUE_TYPE_DATETIME:     3,
+    INDEXED_VALUE_TYPE_KEYWORD:      10,
+    INDEXED_VALUE_TYPE_KEYWORD_LIST: 3,
+    INDEXED_VALUE_TYPE_TEXT:         3,
+}
+```
+
+This means **with SQLite (dev server), you get up to 10 custom Keyword attributes**
+by default. The credential-proxy uses 4 (`CredProxyAgentID`, `CredProxyTargetDomain`,
+`CredProxyCredentialRefHash`, `CredProxyStatus`), which fits well within this limit.
+
+### Registration via CLI
+
+For the dev server, search attributes are registered with:
+
+```bash
+temporal operator search-attribute create \
+  --name CredProxyAgentID --type Keyword \
+  --name CredProxyTargetDomain --type Keyword \
+  --name CredProxyCredentialRefHash --type Keyword \
+  --name CredProxyStatus --type Keyword
+```
+
+### Registration via SDK (typed keys)
+
+The credential-proxy uses the typed SDK approach
+(`audit/search_attributes.go`):
+
+```go
+temporal.NewSearchAttributeKeyString(AttrAgentID).ValueSet(sa.AgentID)
+```
+
+This creates typed search attribute updates that are validated by the server.
+
+## Validation
+
+From `common/searchattribute/validator.go`, the server validates:
+
+1. Number of keys does not exceed the namespace limit
+2. Each key name is defined (either system, predefined, or custom)
+3. System attributes cannot be set by users
+4. Value types match the registered type
+5. Individual value sizes and total size do not exceed limits
+
+### Reserved Prefix
+
+From `sadefs/constants.go`:
+
+```go
+ReservedPrefix = "Temporal"
+```
+
+Custom search attribute names **must not** start with "Temporal". The credential-proxy's
+`CredProxy` prefix is correct and avoids this restriction.
+
+## Caching
+
+The search attribute manager (`common/searchattribute/manager.go`) uses an in-memory
+cache with a 60-second refresh interval:
+
+```go
+cacheRefreshInterval              = 60 * time.Second
+cacheRefreshIfUnavailableInterval = 20 * time.Second
+cacheRefreshColdInterval          = 1 * time.Second
+```
+
+This means newly registered search attributes may take up to 60 seconds to become
+available across all server components.
+
+### Recommendation for credential-proxy
+
+The current search attribute design is sound. Specific notes:
+
+- All four attributes use `Keyword` type, which is correct for exact-match queries
+- Consider whether `CredProxyCredentialRefHash` should be `KeywordList` instead of
+  `Keyword` if you want to query for workflows that used any specific credential
+  (the current implementation joins hashes with commas into a single string)
+- The `CredProxyStatus` attribute enables filtering by terminal state
+  (`success`, `denied`, `error`, `in_progress`)
+
+# Task Queue Architecture
+
+## How Task Queues Route Work
+
+From `docs/architecture/matching-service.md`:
+
+```
+                                    +------------------+
+                                    | Frontend Service |
+                                    +--------+---------+
+                                             |
+                                     PollWorkflowTask /
+                                     PollActivityTask
+                                             |
+                                    +--------v---------+
+                                    | Matching Service  |
+                                    |                   |
+                                    | +--------------+  |
+    History Service                 | | Task Queue   |  |
+    (AddWorkflowTask) ------------>| | Partition 0  |  |----------> Worker 1
+                                    | +--------------+  |
+                                    | | Task Queue   |  |----------> Worker 2
+                                    | | Partition 1  |  |
+                                    | +--------------+  |----------> Worker 3
+                                    | | Task Queue   |  |
+                                    | | Partition N  |  |
+                                    | +--------------+  |
+                                    +-------------------+
+```
+
+The flow:
+
+1. History Service creates a Transfer Task when a workflow/activity task is needed
+2. The Transfer Task queue processor sends the task to the Matching Service
+3. The Matching Service places it in the appropriate task queue partition
+4. Workers long-poll the Matching Service for tasks
+5. When a task and a poller match, the task is dispatched
+
+## Task Queue Partitions
+
+From `service/matching/config.go`:
+
+```go
+NumTaskqueueWritePartitions  dynamicconfig.IntPropertyFnWithTaskQueueFilter
+NumTaskqueueReadPartitions   dynamicconfig.IntPropertyFnWithTaskQueueFilter
+```
+
+Default is 4 partitions. Partitions form a tree where child partitions can forward
+tasks or pollers to parent partitions when idle.
+
+## Sticky Execution
+
+From `service/matching/db.go`:
+
+```go
+stickyTaskQueueTTL = 24 * time.Hour
+```
+
+Sticky task queues are worker-specific queues that allow the same worker to pick
+up subsequent Workflow Tasks for a workflow it has already cached in memory. This
+avoids replaying the full history on every Workflow Task. The TTL is 24 hours.
+
+## Worker Identity
+
+Workers identify themselves with an identity string when polling. From
+`service/matching/workers/worker_query_engine.go`:
+
+```go
+workerIdentityColName = "WorkerIdentity"
+```
+
+The worker identity is recorded in the Matching Service's worker registry and
+used for diagnostics and deployment tracking.
+
+### Recommendation for credential-proxy
+
+The credential-proxy runs a single worker in the same process. This is fine for the
+dev server setup. Key considerations:
+
+- Use a descriptive task queue name (the current `cfg.Temporal.TaskQueue` approach
+  is correct)
+- The single-worker, single-process topology means task queue partitioning is
+  irrelevant for now
+- Sticky execution provides performance benefits for the `ProxyRequestWorkflow`
+  (avoids replaying history on the second Workflow Task after `ValidateAndResolve`)
+
+# Retry Policies
+
+## Server-Side Retry Architecture
+
+From `docs/architecture/retry.md`, the server uses `backoff.ThrottleRetry` with
+two configuration axes:
+
+1. `backoff.IsRetryable` -- decides whether to retry based on error type
+2. `backoff.RetryPolicy` -- controls backoff timing
+
+Activity retries are managed by the server through Timer Tasks. When an activity fails:
+
+1. `RespondActivityTaskFailed` is received by the History Service
+2. If the retry policy allows another attempt, a Timer Task is created with the
+   backoff delay
+3. When the timer fires, a new Transfer Task creates a new Activity Task in Matching
+4. The activity is re-dispatched to a worker
+
+From `docs/architecture/workflow-lifecycle.md` (activity retry section):
+
+```
+Mutable State shows: Activity Task: Scheduled, Attempt 2
+Timer Queue shows: Activity Retry timer
+```
+
+Importantly, **activity retries do NOT generate new `ActivityTaskScheduled` events**.
+The retry counter is tracked in Mutable State, and only the final result
+(success or terminal failure) generates history events.
+
+## Retry Policy Configuration
+
+The credential-proxy currently configures:
+
+```go
+// ValidateAndResolve
+RetryPolicy: &temporal.RetryPolicy{
+    MaximumAttempts: 2,
+}
+
+// FetchAndForward
+RetryPolicy: &temporal.RetryPolicy{
+    MaximumAttempts: 2,
+}
+```
+
+The default retry policy (when not specified) from the Go SDK provides:
+
+- `InitialInterval`: 1 second
+- `BackoffCoefficient`: 2.0
+- `MaximumInterval`: 100 * InitialInterval
+- `MaximumAttempts`: 0 (unlimited)
+
+## Non-Retryable Errors
+
+From `service/worker/addsearchattributes/workflow.go`, the pattern for marking
+errors as non-retryable:
+
+```go
+return temporal.NewNonRetryableApplicationError(
+    fmt.Sprintf("%v: %v", ErrUnableToUpdateESMapping, err),
+    "",   // error type
+    nil,  // cause
+)
+```
+
+### Recommendation for credential-proxy
+
+1. **`ValidateAndResolve`**: `MaximumAttempts: 2` is reasonable. Authorization
+   failures should NOT be retried -- mark `access denied` errors as non-retryable:
+
+    ```go
+    if !result.Allowed {
+        return nil, temporal.NewNonRetryableApplicationError(
+            fmt.Sprintf("access denied: %s", result.Reason),
+            "AUTHORIZATION_DENIED",
+            nil,
+        )
+    }
+    ```
+
+2. **`FetchAndForward`**: `MaximumAttempts: 2` is conservative. Consider:
+   - Network errors to vault/upstream: may benefit from 3 attempts
+   - 4xx responses from upstream: non-retryable (mark explicitly)
+   - 5xx responses from upstream: retryable
+   - Vault auth errors: non-retryable
+
+3. Consider adding `InitialInterval` explicitly (1-2 seconds) for clarity.
+
+# Worker Lifecycle
+
+## Starting and Stopping
+
+From the credential-proxy's `main.go`, the worker lifecycle is:
+
+```go
+// Create worker
+w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{})
+
+// Register workflows and activities
+w.RegisterWorkflow(workflows.ProxyRequestWorkflow)
+w.RegisterWorkflow(workflows.AuditWorkflow)
+w.RegisterActivity(activities)
+
+// Start (non-blocking, launches background goroutines)
+if err := w.Start(); err != nil { ... }
+defer w.Stop()
+```
+
+The `worker.Options` struct (from the Go SDK, not the server) includes:
+
+```go
+type Options struct {
+    MaxConcurrentActivityExecutionSize      int  // default 1000
+    MaxConcurrentWorkflowTaskExecutionSize  int  // default 1000
+    MaxConcurrentLocalActivityExecutionSize int  // default 1000
+    MaxConcurrentActivityTaskPollers        int  // default 2
+    MaxConcurrentWorkflowTaskPollers        int  // default 2
+    StickyScheduleToStartTimeout            time.Duration // default 5s
+    // ... many more
+}
+```
+
+## Graceful Shutdown
+
+`w.Stop()` performs graceful shutdown:
+
+1. Stops accepting new tasks (stops polling)
+2. Waits for in-progress activities and workflow tasks to complete
+3. Drains internal queues
+4. Returns when all work is done (or after a timeout)
+
+The credential-proxy uses `defer w.Stop()` which runs on context cancellation
+(SIGINT/SIGTERM). This is correct.
+
+### Recommendation for credential-proxy
+
+The current lifecycle management is correct. Specific suggestions:
+
+1. Consider setting explicit concurrent execution limits in `worker.Options`:
+
+    ```go
+    w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{
+        MaxConcurrentActivityExecutionSize: 50,   // limit vault/upstream connections
+        MaxConcurrentWorkflowTaskPollers:   2,     // default is fine
+        MaxConcurrentActivityTaskPollers:   2,     // default is fine
+    })
+    ```
+
+2. The `MaxConcurrentActivityExecutionSize` is important because each
+   `FetchAndForward` activity holds a vault secret in memory and an HTTP
+   connection to the upstream API. Limiting this controls resource usage.
+
+3. Consider a shutdown timeout to prevent hanging on long-running upstream requests:
+
+    ```go
+    // In the SIGINT handler, after cancel():
+    time.AfterFunc(30*time.Second, func() {
+        slog.Error("graceful shutdown timed out, forcing exit")
+        os.Exit(1)
+    })
+    ```
+
+# Dev Server
+
+## `temporal-cli server start-dev`
+
+The `temporal-cli` dev server is a single-process Temporal cluster that bundles
+all four services (Frontend, History, Matching, Worker) with an embedded SQLite
+database for persistence.
+
+### Capabilities
+
+- Full Temporal API support (start, signal, query, cancel workflows)
+- Custom search attribute support (up to the SQL pre-allocated limits)
+- Visibility queries using SQL-based list filters
+- Namespace support (uses `default` namespace)
+- Web UI available at `http://localhost:8233` (configurable)
+
+### SQLite Persistence
+
+The dev server uses SQLite for:
+
+- Workflow execution history
+- Mutable state
+- Visibility (search attributes and workflow listing)
+- Task queue metadata
+- Cluster metadata (including custom search attribute definitions)
+
+From `common/searchattribute/sadefs/constants.go`, the SQL visibility backend
+pre-allocates columns for custom search attributes:
+
+```
+Keyword:      10 columns (Keyword01..Keyword10)
+KeywordList:   3 columns
+Int:           3 columns
+Double:        3 columns
+Bool:          3 columns
+Datetime:      3 columns
+Text:          3 columns
+```
+
+### Limitations for Production
+
+1. **Single process**: No fault tolerance, no horizontal scaling
+2. **SQLite**: Single-writer, no concurrent access from multiple processes
+3. **No multi-cluster replication**: No cross-datacenter failover
+4. **No Elasticsearch**: Full-text search on `Text` type attributes is limited
+5. **History shard count**: Fixed at creation, cannot be changed
+6. **Search attribute limits**: Pre-allocated column counts limit the number of
+   custom attributes per type
+
+### Starting the Dev Server for credential-proxy
+
+```bash
+temporal server start-dev \
+  --namespace default \
+  --db-filename /tmp/temporal-credproxy.db \
+  --log-level warn \
+  --search-attribute CredProxyAgentID=Keyword \
+  --search-attribute CredProxyTargetDomain=Keyword \
+  --search-attribute CredProxyCredentialRefHash=Keyword \
+  --search-attribute CredProxyStatus=Keyword
+```
+
+The `--search-attribute` flags register custom search attributes at startup,
+avoiding the need for a separate `temporal operator search-attribute create` call.
+
+# Visibility/Query APIs
+
+## List Filter Syntax
+
+The Temporal visibility API accepts queries using a SQL-like filter syntax.
+From `common/persistence/visibility/store/query/converter.go`, queries are
+parsed using `sqlparser` and converted to backend-specific expressions.
+
+### Supported Operators
+
+| Operator | Description | Example |
+|----------|-------------|---------|
+| `=` | Equality | `CredProxyAgentID = 'agent-001'` |
+| `!=` | Inequality | `CredProxyStatus != 'success'` |
+| `>`, `<`, `>=`, `<=` | Comparison | `StartTime > '2026-01-01T00:00:00Z'` |
+| `IN` | Set membership | `CredProxyStatus IN ('error', 'denied')` |
+| `BETWEEN ... AND` | Range | `StartTime BETWEEN '...' AND '...'` |
+| `IS NULL` / `IS NOT NULL` | Null check | `CloseTime IS NOT NULL` |
+| `AND`, `OR`, `NOT` | Logical | Combined conditions |
+| `ORDER BY` | Ordering | `ORDER BY StartTime DESC` |
+| `STARTS_WITH` | Prefix match | `CredProxyAgentID STARTS_WITH 'agent-'` |
+
+### Forensic Query Examples for credential-proxy
+
+```sql
+-- All requests by a specific agent
+CredProxyAgentID = 'agent-001' ORDER BY StartTime DESC
+
+-- All failed requests to a specific domain
+CredProxyTargetDomain = 'api.anthropic.com' AND CredProxyStatus = 'error'
+
+-- All requests using a specific credential (by hash)
+CredProxyCredentialRefHash = 'abc123hash'
+
+-- All denied requests in a time window
+CredProxyStatus = 'denied'
+  AND StartTime >= '2026-02-01T00:00:00Z'
+  AND StartTime < '2026-02-17T00:00:00Z'
+
+-- All in-progress requests (potentially stuck)
+CredProxyStatus = 'in_progress' AND ExecutionStatus = 'Running'
+
+-- All requests by any agent to a set of domains
+CredProxyTargetDomain IN ('api.openai.com', 'api.anthropic.com')
+  ORDER BY StartTime DESC
+
+-- All completed workflows with their execution duration
+ExecutionStatus = 'Completed' ORDER BY CloseTime DESC
+```
+
+### API Usage
+
+From `service/frontend/workflow_handler.go`, the `ListWorkflowExecutions` endpoint:
+
+```go
+// Go SDK client usage:
+resp, err := client.ListWorkflow(ctx, &workflowservice.ListWorkflowExecutionsRequest{
+    Namespace: "default",
+    Query:     `CredProxyAgentID = 'agent-001' AND CredProxyStatus = 'error'`,
+    PageSize:  100,
+})
+```
+
+Via CLI:
+
+```bash
+temporal workflow list \
+  --query "CredProxyAgentID = 'agent-001' AND CredProxyStatus = 'error'" \
+  --limit 100
+```
+
+### Recommendation for credential-proxy
+
+The visibility API is the primary forensic analysis tool. Consider:
+
+1. Building a dedicated query helper that constructs type-safe queries:
+
+    ```go
+    func QueryByAgent(agentID string) string {
+        return fmt.Sprintf("CredProxyAgentID = '%s' ORDER BY StartTime DESC", agentID)
+    }
+    ```
+
+2. Adding a CLI subcommand or HTTP endpoint that wraps common queries
+3. Using `CountWorkflowExecutions` for aggregate statistics
+   (e.g., "how many denied requests in the last hour?")
+
+# Workflow ID Design
+
+## Patterns
+
+From `service/frontend/workflow_handler.go`, the server supports two conflict
+resolution policies:
+
+### WorkflowIdReusePolicy
+
+Controls what happens when starting a workflow with an ID that was previously used:
+
+- `ALLOW_DUPLICATE`: Allow starting a new execution with the same ID (default)
+- `REJECT_DUPLICATE`: Reject if any previous execution exists with this ID
+
+### WorkflowIdConflictPolicy
+
+Controls what happens when starting a workflow with an ID of a currently running workflow:
+
+- `FAIL`: Return an error (default)
+- `USE_EXISTING`: Return the existing execution's run ID
+- `TERMINATE_EXISTING`: Terminate the running execution and start a new one
+
+## Current credential-proxy Design
+
+The current workflow ID pattern:
+
+```go
+wfID := fmt.Sprintf("credproxy-%s-%d", identity.Subject, time.Now().UnixNano())
+```
+
+This uses a nanosecond timestamp for uniqueness. This works but has properties worth
+considering:
+
+**Pros:**
+
+- Guaranteed unique (within a single process, nanosecond precision)
+- Contains the agent ID for manual identification
+- Simple implementation
+
+**Cons:**
+
+- `time.Now().UnixNano()` is NOT deterministic -- but this is fine because it runs
+  outside the workflow (in the proxy handler goroutine)
+- Nanosecond timestamps are not human-readable
+- No request-level deduplication: if the proxy handler fires twice for the same
+  request (e.g., due to a retry), two separate workflows are created
+
+### Alternative Patterns
+
+1. **Deterministic, request-scoped** (idempotent):
+
+    ```go
+    // Hash of request attributes -- same request always produces same workflow ID
+    wfID := fmt.Sprintf("credproxy-%s-%s-%s-%s",
+        identity.Subject,
+        targetDomain,
+        req.Method,
+        sha256(req.URL.Path + requestBody)[:16],
+    )
+    // Use with WorkflowIdConflictPolicy: USE_EXISTING
+    ```
+
+2. **UUID-based** (unique, no collision risk):
+
+    ```go
+    wfID := fmt.Sprintf("credproxy-%s-%s", identity.Subject, uuid.New().String())
+    ```
+
+3. **Monotonic counter** (sortable, compact):
+
+    ```go
+    // Using atomic counter in the gateway
+    seq := atomic.AddUint64(&gw.auditSeq, 1)
+    wfID := fmt.Sprintf("credproxy-%s-%d", identity.Subject, seq)
+    ```
+
+### Recommendation for credential-proxy
+
+For audit workflows (fire-and-forget, no deduplication needed), the current
+nanosecond-based approach is acceptable. However, if you later add the
+`ProxyRequestWorkflow` to the hot path, consider:
+
+- Using `WorkflowIdConflictPolicy: USE_EXISTING` to deduplicate retries
+- Including enough request context in the ID to make it deterministic
+
+# Namespace Configuration
+
+## What Namespaces Provide
+
+From `service/frontend/namespace_handler.go` (`RegisterNamespace`), namespaces provide:
+
+1. **Isolation**: Workflow executions in different namespaces are completely isolated
+2. **Retention**: Per-namespace workflow history retention period
+3. **Search attribute scope**: Custom search attributes are cluster-wide, but queries
+   are namespace-scoped
+4. **Archival**: Per-namespace archival configuration (history and visibility)
+5. **Replication**: Per-namespace active/standby cluster configuration
+6. **Rate limiting**: Namespace-level rate limits for API calls
+
+## Default vs Custom Namespaces
+
+- The `default` namespace is created automatically
+- Custom namespaces must be registered before use
+- The dev server creates the `default` namespace on startup
+
+### Namespace Registration
+
+```bash
+temporal operator namespace create \
+  --namespace credproxy-audit \
+  --retention 30d \
+  --description "Credential proxy audit workflows"
+```
+
+Or via the CLI dev server:
+
+```bash
+temporal server start-dev --namespace credproxy-audit
+```
+
+### Recommendation for credential-proxy
+
+Using the `default` namespace is fine for development. For production, consider:
+
+1. Using a dedicated namespace (e.g., `credproxy`) with explicit retention
+2. Setting a retention period appropriate for audit requirements
+   (e.g., 90 days for compliance)
+3. Configuring archival for long-term audit trail preservation
+
+# Architecture Diagram
+
+```
++--------------------------------------------------------------------+
+|                        credential-proxy process                     |
+|                                                                     |
+|  +------------------+    +------------------+    +--------------+   |
+|  | VSOCK Listener   |--->| goproxy Gateway  |--->| Temporal     |   |
+|  | (port N)         |    |                  |    | Client       |   |
+|  +------------------+    | HandleConnect    |    |              |   |
+|                          | OnRequest -------|----| StartWorkflow|   |
+|                          | OnResponse       |    +--------------+   |
+|                          +------------------+                       |
+|                                                                     |
+|  +------------------+                                               |
+|  | Temporal Worker  |    Polls task queue, executes activities       |
+|  |                  |                                               |
+|  | - AuditWorkflow  |    (search attr upsert only, no activities)   |
+|  | - ProxyRequest   |    (ValidateAndResolve + FetchAndForward)     |
+|  |   Workflow       |                                               |
+|  |                  |                                               |
+|  | Activities:      |                                               |
+|  |  - Vault Client  |    (fetches secrets, in-memory only)          |
+|  |  - HTTP Client   |    (forwards to upstream API)                 |
+|  |  - OPA Evaluator |    (policy evaluation)                        |
+|  +------------------+                                               |
++--------------------------------------------------------------------+
+         |
+         | gRPC (localhost:7233)
+         v
++--------------------------------------------------------------------+
+|                     Temporal Dev Server                              |
+|                                                                     |
+|  +----------+  +----------+  +----------+  +----------+            |
+|  | Frontend |  | History  |  | Matching |  | Worker   |            |
+|  | Service  |  | Service  |  | Service  |  | Service  |            |
+|  +----------+  +----------+  +----------+  +----------+            |
+|                                                                     |
+|  +--------------------------------------------------------------+  |
+|  |                    SQLite Database                             |  |
+|  |  - Workflow execution history (event sourced)                 |  |
+|  |  - Mutable state (cached workflow state)                      |  |
+|  |  - Visibility records (search attributes for queries)         |  |
+|  |  - Task queue metadata                                        |  |
+|  |  - Cluster metadata (custom search attribute definitions)     |  |
+|  +--------------------------------------------------------------+  |
++--------------------------------------------------------------------+
+```
+
+# Summary of Findings
+
+| Area | Finding | Impact on credential-proxy |
+|------|---------|---------------------------|
+| Workflow determinism | Workflows replay from history; must be deterministic | Current code uses `workflow.Now()` correctly |
+| Event history | All workflow/activity I/O is persisted forever | Secret values must NEVER appear in inputs/outputs |
+| Search attributes | Up to 10 Keyword attrs on SQLite; SQL-like queries | 4 Keyword attrs fit well; queries enable forensics |
+| Task queues | Partitioned, with sticky execution for performance | Single worker is fine for dev; partitioning irrelevant |
+| Retry policies | Server manages retries via Timer Tasks | Mark auth failures as non-retryable; add explicit intervals |
+| Worker lifecycle | `Start()` / `Stop()` with graceful shutdown | Current `defer w.Stop()` is correct; add concurrency limits |
+| Dev server | SQLite-backed, all services in one process | Sufficient for dev/test; not for production |
+| Visibility API | SQL-like filter syntax on search attributes | Build forensic query helpers for common patterns |
+| Workflow IDs | ReusePolicy + ConflictPolicy for deduplication | Current nanosecond-based IDs work; consider deterministic IDs |
+| Namespaces | Isolation, retention, archival configuration | Use `default` for dev; dedicated namespace for production |
+
+# Key Recommendations Summary
+
+1. **Mark authorization denials as non-retryable errors** in `ValidateAndResolve`
+   using `temporal.NewNonRetryableApplicationError()`
+
+2. **Set explicit worker concurrency limits** for `MaxConcurrentActivityExecutionSize`
+   to control vault connection and upstream HTTP connection counts
+
+3. **Consider `KeywordList` type** for `CredProxyCredentialRefHash` if multi-credential
+   queries are needed
+
+4. **Add `--search-attribute` flags** to the dev server startup command to register
+   all four custom attributes at boot time
+
+5. **Build forensic query helpers** wrapping the visibility API for common audit patterns
+   (by agent, by domain, by status, by time range)
+
+6. **Add shutdown timeout** to prevent the process from hanging if an upstream request
+   is stuck during graceful shutdown
+
+7. **The current secret isolation design is correct**: vault paths in event history
+   are safe, actual secrets only exist in `FetchAndForward` activity memory
+
+8. **For production**: use a dedicated namespace with appropriate retention, consider
+   Elasticsearch for full-text search, and run Temporal as a proper cluster

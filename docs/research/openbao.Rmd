@@ -1,0 +1,930 @@
+---
+title: "OpenBao Research Report for credential-proxy"
+date: "2026-02-17"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Executive Summary
+
+This report documents findings from a source-level exploration of the OpenBao
+codebase (a fork of HashiCorp Vault) as it relates to the credential-proxy
+project. The credential-proxy is a Go MITM forward proxy that fetches real API
+credentials from OpenBao's KV v2 secret engine and injects them into outbound
+HTTP requests. It uses the `openbao/api/v2` Go client library
+(`v2.5.1`).
+
+Key findings:
+
+- The KV v2 API has a well-defined `data.data` double-nesting envelope that our
+  current `FetchCredential` code already handles correctly.
+- OpenBao supports AppRole authentication natively -- role_id + secret_id flow
+  with configurable token TTL, max TTL, and periodic tokens.
+- The `LifetimeWatcher` in the API client provides built-in token renewal with
+  exponential backoff and grace period jitter.
+- OpenBao reads `BAO_*` environment variables but falls back to `VAULT_*`
+  equivalents for backward compatibility.
+- Policy language uses HCL with path-based ACL capabilities including a `patch`
+  and `scan` capability not present in upstream Vault.
+- Audit backends log HMAC-hashed versions of all request/response data by
+  default, never logging plaintext secrets.
+- Transit engine provides envelope encryption with `encrypt/`, `decrypt/`, and
+  `datakey/` endpoints.
+- The existing NixOS policy module (`openbao-policy.nix`) already provisions a
+  `credproxy-readonly` policy at build time.
+
+# KV v2 Secret Engine
+
+## Data Envelope Structure
+
+The KV v2 engine stores secrets at `{mount}/data/{path}` and metadata at
+`{mount}/metadata/{path}`. When reading a secret, the HTTP response body has
+the following structure:
+
+```json
+{
+  "request_id": "...",
+  "lease_id": "",
+  "renewable": false,
+  "lease_duration": 0,
+  "data": {
+    "data": {
+      "key": "sk-ant-xxx",
+      "header_name": "x-api-key",
+      "header_prefix": ""
+    },
+    "metadata": {
+      "version": 3,
+      "created_time": "2026-02-15T10:00:00.000Z",
+      "deletion_time": "",
+      "destroyed": false,
+      "custom_metadata": null
+    }
+  }
+}
+```
+
+The outer `data` field is the standard Vault response envelope. The inner
+`data` field contains the actual secret key-value pairs. This is the `data.data`
+nesting that the credential-proxy's `FetchCredential` method correctly unwraps:
+
+```go
+// From credential-proxy/vault/client.go lines 72-74
+data, ok := secret.Data["data"].(map[string]interface{})
+if !ok {
+    return nil, fmt.Errorf("%w: %s (missing data envelope)", ErrSecretNotFound, vaultPath)
+}
+```
+
+**Source:** `openbao/builtin/logical/kv/path_data.go` lines 134-188 -- the
+`pathDataRead()` function constructs this response explicitly.
+
+## High-Level KV v2 Client API
+
+The `openbao/api/v2` package provides a typed `KVv2` client accessed via
+`client.KVv2(mountPath)`. Key methods:
+
+| Method | Description | API Path |
+|--------|-------------|----------|
+| `Get(ctx, secretPath)` | Read latest version | `{mount}/data/{path}` |
+| `GetVersion(ctx, secretPath, version)` | Read specific version | `{mount}/data/{path}?version=N` |
+| `Put(ctx, secretPath, data, ...opts)` | Write new version | `{mount}/data/{path}` |
+| `Patch(ctx, secretPath, newData, ...opts)` | Partial update | `{mount}/data/{path}` (PATCH) |
+| `Delete(ctx, secretPath)` | Soft-delete latest | `{mount}/data/{path}` (DELETE) |
+| `DeleteVersions(ctx, secretPath, versions)` | Soft-delete specific versions | `{mount}/delete/{path}` |
+| `Undelete(ctx, secretPath, versions)` | Restore soft-deleted | `{mount}/undelete/{path}` |
+| `Destroy(ctx, secretPath, versions)` | Permanently destroy | `{mount}/destroy/{path}` |
+| `GetMetadata(ctx, secretPath)` | Read full metadata | `{mount}/metadata/{path}` |
+| `Rollback(ctx, secretPath, toVersion)` | Roll back to version | Read + CAS write |
+
+**Source:** `openbao/api/kv_v2.go`
+
+## Recommendation: Upgrade to Typed KV v2 API
+
+The current credential-proxy uses the low-level `client.Logical().ReadWithContext()`
+approach, which requires manual `data.data` unwrapping. The higher-level
+`client.KVv2("secret").Get(ctx, "openclaw/credentials/anthropic")` returns a
+typed `*KVSecret` with `Data` already unwrapped and `VersionMetadata` parsed.
+
+Benefits:
+
+- Eliminates manual type assertions for the data envelope.
+- Provides typed `KVVersionMetadata` (version number, created time, deletion time, destroyed flag).
+- Returns `api.ErrSecretNotFound` when the secret does not exist, consistent with what our
+  `ErrSecretNotFound` sentinel mirrors.
+- Note that the high-level API takes *just* the secret path without the `data/` prefix --
+  for example `"openclaw/credentials/anthropic"` instead of `"secret/data/openclaw/credentials/anthropic"`.
+
+Example migration:
+
+```go
+func (c *OpenBaoClient) FetchCredential(ctx context.Context, secretName string) (*CredentialValue, error) {
+    kvSecret, err := c.client.KVv2("secret").Get(ctx, secretName)
+    if err != nil {
+        if errors.Is(err, baoapi.ErrSecretNotFound) {
+            return nil, fmt.Errorf("%w: %s", ErrSecretNotFound, secretName)
+        }
+        return nil, fmt.Errorf("read secret %s: %w", secretName, err)
+    }
+
+    key, _ := kvSecret.Data["key"].(string)
+    headerName, _ := kvSecret.Data["header_name"].(string)
+    headerPrefix, _ := kvSecret.Data["header_prefix"].(string)
+
+    if key == "" || headerName == "" {
+        return nil, fmt.Errorf("secret %s: missing required fields", secretName)
+    }
+
+    return &CredentialValue{
+        Key:          key,
+        HeaderName:   headerName,
+        HeaderPrefix: headerPrefix,
+    }, nil
+}
+```
+
+## Versioning and Check-and-Set (CAS)
+
+KV v2 automatically versions all writes. Each write increments the version
+counter. The engine supports:
+
+- **`max_versions`** (configurable per-key or at the mount level): limits how
+  many versions are retained. Oldest versions are garbage collected.
+- **`delete_version_after`**: automatic deletion of versions after a duration.
+- **Check-and-Set (CAS)**: prevents lost updates via optimistic concurrency.
+  Passing `WithCheckAndSet(cas)` ensures the write only succeeds if the key's
+  current version matches `cas`. A `cas` of 0 means "only if key does not exist."
+
+**Source:** `openbao/api/kv_v2.go` lines 93-100, `openbao/builtin/logical/kv/path_data.go`
+lines 193-221
+
+## Soft-Delete vs Destroy
+
+- **Delete** (soft-delete): Marks a version's `deletion_time`. The data is
+  retained but reads return 404 with metadata. Can be reversed with `Undelete`.
+- **Destroy** (hard-delete): Permanently removes the version data. Sets
+  `destroyed = true`. Irreversible.
+- **DeleteMetadata**: Destroys ALL versions and the metadata entry itself.
+
+For the credential-proxy, which only needs read access, none of these operations
+are relevant, but understanding the distinction matters for policy design (the
+proxy must NOT have `delete` capability).
+
+
+# Policy Language
+
+## Path-Based ACL Policies
+
+OpenBao policies are written in HCL. Each policy defines one or more `path`
+blocks with associated `capabilities`. The path is relative to the Vault API
+(everything after `/v1/`).
+
+**Source:** `openbao/vault/policy.go` lines 250-300 (`ParseACLPolicy`)
+
+### Capabilities
+
+From `openbao/vault/policy.go` lines 26-41:
+
+| Capability | Description |
+|------------|-------------|
+| `deny` | Explicitly deny access (overrides all other capabilities) |
+| `create` | Create new data at a path |
+| `read` | Read data from a path |
+| `update` | Update existing data at a path |
+| `delete` | Delete data at a path |
+| `list` | List keys at a path |
+| `sudo` | Access root-protected endpoints |
+| `patch` | HTTP PATCH for partial updates (OpenBao addition) |
+| `scan` | Scan/iterate resources (OpenBao addition) |
+
+The `patch` and `scan` capabilities are OpenBao-specific and are not present in
+upstream HashiCorp Vault.
+
+### Path Wildcards
+
+- **Glob suffix (`*`)**: `secret/data/openclaw/*` matches any path starting
+  with `secret/data/openclaw/`. The asterisk is stripped and the path is treated
+  as a prefix match (`IsPrefix = true`).
+- **Segment wildcards (`+`)**: `secret/data/+/credentials` matches any single
+  path segment. Multiple segment wildcards are supported.
+- **`+*` is forbidden**: The combination is explicitly rejected in the parser.
+
+**Source:** `openbao/vault/policy.go` lines 391-407
+
+### Example: Read-Only Policy for credential-proxy
+
+```hcl
+# credproxy-readonly.hcl
+# Allows the credential-proxy service to read credentials from the KV v2 store.
+
+# Read secret data (the actual credentials)
+path "secret/data/openclaw/credentials/*" {
+  capabilities = ["read"]
+}
+
+# Read secret metadata (version info, without secret values)
+path "secret/metadata/openclaw/credentials/*" {
+  capabilities = ["read", "list"]
+}
+```
+
+This policy:
+
+- Grants `read` on `secret/data/openclaw/credentials/*` -- allows fetching any
+  credential under the `openclaw/credentials/` prefix.
+- Grants `read` and `list` on `secret/metadata/openclaw/credentials/*` -- allows
+  listing available credentials and reading version metadata.
+- Does NOT grant `create`, `update`, `delete`, `patch`, or `sudo` -- the proxy
+  cannot modify, delete, or escalate.
+
+### Policy Evaluation: Deny Wins
+
+When multiple policies apply to a token, capabilities are unioned EXCEPT for
+`deny`, which always wins. The proxy's token should only have the single
+`credproxy-readonly` policy. The built-in `default` policy is attached to most
+tokens and grants basic self-introspection paths like `auth/token/lookup-self`.
+
+### NixOS Policy Provisioning
+
+The existing NixOS module at `modules/credential-proxy/openbao-policy.nix`
+already configures this policy declaratively:
+
+```nix
+CUSTOM.virtualisation.openbao = {
+  policies = [
+    {
+      name = "credproxy-readonly";
+      paths = [
+        "secret/data/openclaw/credentials/*"
+        "secret/metadata/openclaw/credentials/*"
+      ];
+      capabilities = [ "read" "list" ];
+    }
+  ];
+};
+```
+
+This is applied at NixOS build time through the standalone openbao module.
+
+
+# AppRole Authentication
+
+## Overview
+
+AppRole is the recommended auth method for service (non-human) authentication.
+It uses two credentials:
+
+1. **`role_id`**: A UUID that uniquely identifies the role. Analogous to a
+   username. Typically baked into the service's configuration or deployed via
+   infrastructure tooling.
+2. **`secret_id`**: A UUID that serves as the password. Optionally has a TTL,
+   use count, and CIDR restrictions.
+
+**Source:** `openbao/builtin/credential/approle/path_login.go`,
+`openbao/builtin/credential/approle/path_role.go`
+
+## Login Flow
+
+```
+POST /v1/auth/approle/login
+{
+  "role_id": "db02de05-fa39-4855-059b-67221c5c2f63",
+  "secret_id": "6a174c20-f6de-a53c-74d2-6018fcceff64"
+}
+```
+
+Response includes a client token with the policies attached to the role:
+
+```json
+{
+  "auth": {
+    "client_token": "s.p3RqXEz...",
+    "accessor": "OQNld...",
+    "policies": ["default", "credproxy-readonly"],
+    "lease_duration": 3600,
+    "renewable": true,
+    "metadata": {
+      "role_name": "credproxy"
+    }
+  }
+}
+```
+
+## Role Configuration
+
+Key role parameters from `roleStorageEntry` (`path_role.go` lines 28-83):
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `role_id` | string | Unique identifier for the role |
+| `bind_secret_id` | bool | Require secret_id for login (default: true) |
+| `secret_id_num_uses` | int | Max uses per secret_id (0 = unlimited) |
+| `secret_id_ttl` | duration | Expiration for generated secret_ids |
+| `secret_id_bound_cidrs` | []string | CIDR allowlist for login attempts |
+| `token_ttl` | duration | Initial TTL for generated tokens |
+| `token_max_ttl` | duration | Maximum TTL (caps renewals) |
+| `token_period` | duration | Period for periodic tokens |
+| `token_policies` | []string | Policies to attach to tokens |
+| `token_bound_cidrs` | []string | CIDR restrictions for the issued token |
+| `token_num_uses` | int | Max uses for the issued token |
+
+## Go Client Usage
+
+Using the `openbao/api/v2` client, AppRole login would look like:
+
+```go
+import baoapi "github.com/openbao/openbao/api/v2"
+
+func loginAppRole(client *baoapi.Client, roleID, secretID string) (*baoapi.Secret, error) {
+    data := map[string]interface{}{
+        "role_id":   roleID,
+        "secret_id": secretID,
+    }
+    secret, err := client.Logical().Write("auth/approle/login", data)
+    if err != nil {
+        return nil, fmt.Errorf("AppRole login: %w", err)
+    }
+    if secret == nil || secret.Auth == nil {
+        return nil, errors.New("AppRole login returned no auth data")
+    }
+    // The client's token is NOT automatically set by Logical().Write().
+    // Use Auth().Login() for automatic token setting, or set manually:
+    client.SetToken(secret.Auth.ClientToken)
+    return secret, nil
+}
+```
+
+Alternatively, if implementing the `api.AuthMethod` interface:
+
+```go
+type AppRoleAuth struct {
+    RoleID   string
+    SecretID string
+}
+
+func (a *AppRoleAuth) Login(ctx context.Context, client *baoapi.Client) (*baoapi.Secret, error) {
+    data := map[string]interface{}{
+        "role_id":   a.RoleID,
+        "secret_id": a.SecretID,
+    }
+    return client.Logical().WriteWithContext(ctx, "auth/approle/login", data)
+}
+
+// Usage:
+secret, err := client.Auth().Login(ctx, &AppRoleAuth{
+    RoleID:   cfg.RoleID,
+    SecretID: cfg.SecretID,
+})
+// client.Token() is now automatically set
+```
+
+## Recommendation: AppRole Setup for credential-proxy
+
+```bash
+# Enable AppRole auth method
+bao auth enable approle
+
+# Create the role
+bao write auth/approle/role/credproxy \
+    token_policies="credproxy-readonly" \
+    token_ttl=1h \
+    token_max_ttl=4h \
+    secret_id_ttl=720h \
+    secret_id_num_uses=0 \
+    bind_secret_id=true
+
+# Get the role_id (deploy to service config)
+bao read auth/approle/role/credproxy/role-id
+
+# Generate a secret_id (deploy securely -- e.g. via NixOS agenix)
+bao write -f auth/approle/role/credproxy/secret-id
+```
+
+
+# Token Renewal and Revocation
+
+## Token Lifecycle
+
+Tokens issued by AppRole (or any auth method) have:
+
+- **TTL**: The initial time-to-live. After this period, the token expires unless
+  renewed.
+- **Max TTL**: The absolute maximum lifetime. After this, no further renewals
+  are possible and the service must re-authenticate.
+- **Period** (for periodic tokens): If set on the role, the token's TTL resets
+  to this value on each renewal, with no max TTL cap. Useful for long-running
+  services.
+
+## LifetimeWatcher (Automatic Renewal)
+
+The `openbao/api/v2` library provides `LifetimeWatcher` for automatic token
+renewal. It sleeps for approximately 2/3 of the remaining lease duration plus
+a jittered grace period, then calls `RenewTokenAsSelf`.
+
+**Source:** `openbao/api/lifetime_watcher.go`
+
+```go
+watcher, err := client.NewLifetimeWatcher(&baoapi.LifetimeWatcherInput{
+    Secret:        loginSecret,    // The secret returned from Auth().Login()
+    RenewBehavior: baoapi.RenewBehaviorIgnoreErrors,
+})
+if err != nil {
+    return err
+}
+
+go watcher.Start()
+defer watcher.Stop()
+
+for {
+    select {
+    case err := <-watcher.DoneCh():
+        if err != nil {
+            log.Printf("Token watcher error: %v", err)
+        }
+        // Token is exhausted or max TTL reached -- must re-authenticate
+        return reauthenticate()
+
+    case renewal := <-watcher.RenewCh():
+        log.Printf("Token renewed at %v, new TTL: %ds",
+            renewal.RenewedAt,
+            renewal.Secret.Auth.LeaseDuration)
+    }
+}
+```
+
+### RenewBehavior Options
+
+From `openbao/api/lifetime_watcher.go` lines 36-52:
+
+| Behavior | Description |
+|----------|-------------|
+| `RenewBehaviorIgnoreErrors` | Keep watching even if renewal fails; exit at grace threshold. **Recommended for services.** |
+| `RenewBehaviorRenewDisabled` | Do not attempt renewal; just watch the lifetime. |
+| `RenewBehaviorErrorOnErrors` | Exit immediately on any renewal error (legacy behavior). |
+
+### Grace Period Calculation
+
+The grace period is 10-20% of the minimum of (remaining lease, requested
+increment). Jitter is added to prevent thundering herd when multiple services
+renew simultaneously.
+
+**Source:** `openbao/api/lifetime_watcher.go` lines 395-412
+
+## Token Revocation
+
+The API provides several revocation methods:
+
+| Method | Description | API Endpoint |
+|--------|-------------|-------------|
+| `RevokeSelf()` | Revoke the current token | `PUT /v1/auth/token/revoke-self` |
+| `RevokeTree(token)` | Revoke token and all children | `PUT /v1/auth/token/revoke` |
+| `RevokeOrphan(token)` | Revoke token, orphan children | `PUT /v1/auth/token/revoke-orphan` |
+| `RevokeAccessor(accessor)` | Revoke via accessor (does not require token) | `POST /v1/auth/token/revoke-accessor` |
+
+**Source:** `openbao/api/auth_token.go`
+
+## Recommendation: Periodic Token for credential-proxy
+
+For the credential-proxy, which is a long-running service, configure the AppRole
+with `token_period` instead of `token_max_ttl`:
+
+```bash
+bao write auth/approle/role/credproxy \
+    token_policies="credproxy-readonly" \
+    token_period=1h \
+    bind_secret_id=true
+```
+
+This creates a periodic token that:
+
+- Renews its TTL to 1 hour on every successful renewal.
+- Never hits a max TTL cap (the token can live indefinitely as long as the
+  service keeps renewing).
+- If the service crashes and misses renewal for > 1 hour, the token expires and
+  the service must re-authenticate with AppRole.
+
+The `LifetimeWatcher` with `RenewBehaviorIgnoreErrors` handles this automatically.
+When `DoneCh()` fires, the service re-authenticates.
+
+
+# Secret Versioning
+
+## Version History
+
+KV v2 automatically versions all writes. The `KVMetadata` struct holds:
+
+```go
+type KVMetadata struct {
+    CASRequired        bool
+    CreatedTime        time.Time
+    CurrentVersion     int
+    CustomMetadata     map[string]interface{}
+    DeleteVersionAfter time.Duration
+    MaxVersions        int
+    OldestVersion      int
+    UpdatedTime        time.Time
+    Versions           map[string]KVVersionMetadata  // keyed by version number as string
+}
+
+type KVVersionMetadata struct {
+    Version      int
+    CreatedTime  time.Time
+    DeletionTime time.Time  // zero value if not deleted
+    Destroyed    bool
+}
+```
+
+**Source:** `openbao/api/kv_v2.go` lines 24-36, 68-73
+
+## Version Retrieval
+
+```go
+// Get latest
+kvSecret, err := client.KVv2("secret").Get(ctx, "openclaw/credentials/anthropic")
+
+// Get specific version
+kvSecret, err := client.KVv2("secret").GetVersion(ctx, "openclaw/credentials/anthropic", 2)
+
+// Get sorted list of all versions
+versions, err := client.KVv2("secret").GetVersionsAsList(ctx, "openclaw/credentials/anthropic")
+```
+
+## Credential Rotation Pattern
+
+For credential rotation, the recommended pattern is:
+
+1. Write new credential as a new version.
+2. Old versions remain accessible by version number.
+3. Services reading "latest" automatically get the new credential.
+4. After a grace period, destroy old versions.
+
+The credential-proxy always reads the latest version (no version parameter), so
+credential rotation is transparent to it.
+
+
+# Audit Logging
+
+## Audit Backend Interface
+
+OpenBao supports three types of audit backends:
+
+1. **File**: Writes JSON audit entries to a file on disk.
+2. **Syslog**: Sends audit entries to the system syslog daemon.
+3. **Socket**: Streams audit entries to a TCP/UDP/Unix socket.
+
+The `Backend` interface requires:
+
+```go
+type Backend interface {
+    LogRequest(context.Context, *logical.LogInput) error
+    LogResponse(context.Context, *logical.LogInput) error
+    LogTestMessage(context.Context, *logical.LogInput, map[string]string) error
+    GetHash(context.Context, string) (string, error)
+    Reload(context.Context) error
+    Invalidate(context.Context)
+}
+```
+
+**Source:** `openbao/audit/audit.go`
+
+## What Gets Logged
+
+Every request and response generates two log entries:
+
+1. **Request entry** (`AuditRequestEntry`): Logged BEFORE the request is
+   executed. Includes auth info, operation, path, request data.
+2. **Response entry** (`AuditResponseEntry`): Logged AFTER the response is
+   generated. Includes all request info PLUS response data, warnings, errors.
+
+**Source:** `openbao/audit/format.go` lines 397-457
+
+### HMAC Hashing of Sensitive Data
+
+By default (when `Raw` is false), all audit data is HMAC-hashed before logging:
+
+- Client tokens are HMAC-hashed.
+- Token accessors are HMAC-hashed (controlled by `HMACAccessor` config).
+- All request data values are HMAC-hashed.
+- All response data values are HMAC-hashed.
+
+This means **secret values never appear in plaintext in audit logs**. The HMAC
+is computed using a per-audit-backend salt, so different audit backends produce
+different hashes for the same value.
+
+To verify whether a known value appears in the audit log, use the
+`sys/audit-hash/{backend}` API endpoint, which returns the HMAC for a given
+input string using the specified backend's salt.
+
+**Source:** `openbao/audit/hashstructure.go`, `openbao/audit/format.go` lines 70-80
+
+### Audit Entry Structure
+
+For a credential read by the proxy, the audit log would contain:
+
+```json
+{
+  "time": "2026-02-17T10:00:00.000000000Z",
+  "type": "response",
+  "auth": {
+    "client_token": "hmac-sha256:abc123...",
+    "accessor": "hmac-sha256:def456...",
+    "policies": ["default", "credproxy-readonly"],
+    "token_type": "service",
+    "metadata": {
+      "role_name": "credproxy"
+    }
+  },
+  "request": {
+    "id": "req-uuid",
+    "operation": "read",
+    "mount_point": "secret/",
+    "mount_type": "kv",
+    "path": "secret/data/openclaw/credentials/anthropic",
+    "remote_address": "127.0.0.1"
+  },
+  "response": {
+    "data": {
+      "data": {
+        "key": "hmac-sha256:789abc...",
+        "header_name": "hmac-sha256:...",
+        "header_prefix": "hmac-sha256:..."
+      },
+      "metadata": {
+        "version": "hmac-sha256:...",
+        "created_time": "hmac-sha256:..."
+      }
+    }
+  }
+}
+```
+
+## Enabling Audit
+
+```bash
+# File-based audit (recommended for the VM)
+bao audit enable file file_path=/var/log/openclaw/openbao-audit.log
+
+# Syslog (for centralized logging)
+bao audit enable syslog tag="openbao" facility="AUTH"
+
+# Socket (for real-time streaming to SIEM)
+bao audit enable socket address="127.0.0.1:9090" socket_type="tcp"
+```
+
+## Audit and the Credential-Proxy
+
+Audit logging is critical for the credential-proxy use case because it provides:
+
+- **Access trail**: Who (which token/entity) read which credential and when.
+- **Anomaly detection**: Unusual access patterns (e.g., reads from unexpected
+  IPs) can be flagged.
+- **Compliance**: Proves that only authorized services accessed credentials.
+
+The NixOS module already configures audit logging at
+`/var/log/openclaw/openbao-audit.log` via the `auditLogPath` option.
+
+
+# Transit Engine
+
+## Overview
+
+The Transit secret engine provides cryptographic operations without exposing
+encryption keys. It is useful for envelope encryption, where the proxy could
+encrypt cached credentials at rest.
+
+**Source:** `openbao/builtin/logical/transit/`
+
+## Key Operations
+
+| Endpoint | Description |
+|----------|-------------|
+| `transit/keys/{name}` | Create/manage named encryption keys |
+| `transit/encrypt/{name}` | Encrypt plaintext with a named key |
+| `transit/decrypt/{name}` | Decrypt ciphertext with a named key |
+| `transit/datakey/{plaintext\|wrapped}/{name}` | Generate data encryption keys |
+| `transit/rewrap/{name}` | Re-encrypt ciphertext with a newer key version |
+| `transit/sign/{name}` | Sign data with a named key |
+| `transit/verify/{name}` | Verify a signature |
+| `transit/hash` | Generate a hash of data |
+| `transit/hmac/{name}` | Generate an HMAC |
+
+## Data Key Generation (Envelope Encryption)
+
+For envelope encryption of cached credentials:
+
+```bash
+# Create a transit key
+bao write -f transit/keys/credproxy-cache
+
+# Generate a data encryption key
+bao write transit/datakey/plaintext/credproxy-cache
+# Returns:
+# {
+#   "data": {
+#     "plaintext": "base64-encoded-key",    # Use this for local encryption
+#     "ciphertext": "vault:v1:base64..."     # Store this for key recovery
+#   }
+# }
+```
+
+## Recommendation: Not Immediately Needed
+
+The credential-proxy currently does not cache credentials (it fetches from
+OpenBao on each request, mediated by Temporal workflows). Transit encryption
+would be relevant if we add a local credential cache. For now, it is not needed,
+but the policy can be pre-configured:
+
+```hcl
+# Future: if credential caching is added
+path "transit/encrypt/credproxy-cache" {
+  capabilities = ["update"]
+}
+
+path "transit/decrypt/credproxy-cache" {
+  capabilities = ["update"]
+}
+
+path "transit/datakey/plaintext/credproxy-cache" {
+  capabilities = ["update"]
+}
+```
+
+
+# NixOS Integration
+
+## Existing Configuration
+
+The project has two NixOS modules that configure OpenBao:
+
+### 1. OpenClaw OpenBao Module (`modules/openclaw/openbao.nix`)
+
+This is the higher-level OpenClaw-specific wrapper that:
+
+- Sets `dataDir`, `unsealKeysDir`, `auditLogPath` under `/var/lib/openclaw/`.
+- Configures OIDC auth with Keycloak for human users.
+- Derives per-instance policies from `cfg.instances`.
+- Configures OIDC roles per instance.
+
+### 2. Credential Proxy Policy Module (`modules/credential-proxy/openbao-policy.nix`)
+
+This thin wrapper adds the `credproxy-readonly` policy:
+
+```nix
+CUSTOM.virtualisation.openbao = {
+  policies = [
+    {
+      name = "credproxy-readonly";
+      paths = [
+        "secret/data/openclaw/credentials/*"
+        "secret/metadata/openclaw/credentials/*"
+      ];
+      capabilities = [ "read" "list" ];
+    }
+  ];
+};
+```
+
+## Build-Time Policy Provisioning
+
+The NixOS approach has a significant advantage: policies are defined declaratively
+and provisioned at build time (during `nixos-rebuild`). This means:
+
+- No manual `bao policy write` commands needed in production.
+- Policy changes are version-controlled and reproducible.
+- Rollback is as simple as rolling back the NixOS generation.
+
+However, the actual provisioning depends on the standalone openbao module's
+implementation of how it translates the `policies` list into actual OpenBao
+policy writes. The module likely runs a systemd unit that uses the root token
+to write policies during initialization.
+
+## Recommendation: AppRole Provisioning
+
+The NixOS module should also handle AppRole creation. This would involve:
+
+1. Creating the AppRole role with the correct policies.
+2. Extracting the `role_id`.
+3. Generating a `secret_id`.
+4. Deploying both to the credential-proxy's configuration (via agenix or
+   similar secrets management).
+
+This is a future enhancement to the standalone openbao NixOS module.
+
+
+# API Differences from Vault
+
+## Environment Variables
+
+OpenBao uses `BAO_*` environment variable prefix instead of `VAULT_*`, but
+the client library has **backward compatibility**: if a `BAO_*` variable is not
+set, it falls back to the `VAULT_*` equivalent.
+
+**Source:** `openbao/api/env.go` -- `ReadBaoVariable()` checks `BAO_*` first,
+then falls back to `VAULT_*`.
+
+Key environment variable mappings:
+
+| OpenBao (`BAO_*`) | Vault (`VAULT_*`) | Description |
+|--------------------|--------------------|-------------|
+| `BAO_ADDR` | `VAULT_ADDR` | Server address |
+| `BAO_TOKEN` | `VAULT_TOKEN` | Client token |
+| `BAO_CACERT` | `VAULT_CACERT` | CA certificate path |
+| `BAO_SKIP_VERIFY` | `VAULT_SKIP_VERIFY` | Skip TLS verification |
+| `BAO_NAMESPACE` | `VAULT_NAMESPACE` | Namespace |
+| `BAO_MAX_RETRIES` | `VAULT_MAX_RETRIES` | Max retry count |
+
+## Additional Capabilities
+
+OpenBao adds two capabilities not in upstream Vault:
+
+- **`patch`**: Used for HTTP PATCH (merge-patch) operations on KV v2.
+- **`scan`**: Used for paginated list/scan operations.
+
+These are defined in `openbao/vault/policy.go` lines 34-35.
+
+## Module Path
+
+The Go module path changed from `github.com/hashicorp/vault/api` to
+`github.com/openbao/openbao/api/v2`. The `v2` suffix is significant -- it
+represents a major version bump with breaking changes from the Vault `v1` API
+module.
+
+## CLI Command Name
+
+The CLI binary is `bao` instead of `vault`. However, most subcommands are
+identical.
+
+## API Compatibility
+
+Based on source analysis, the HTTP API endpoints are identical to Vault's for
+all features examined in this report:
+
+- KV v2: Same endpoints (`secret/data/`, `secret/metadata/`, etc.)
+- AppRole: Same endpoints (`auth/approle/login`, `auth/approle/role/`, etc.)
+- Token: Same endpoints (`auth/token/renew-self`, `auth/token/lookup-self`, etc.)
+- Audit: Same endpoints (`sys/audit/`, `sys/audit-hash/`)
+- Transit: Same endpoints (`transit/encrypt/`, `transit/decrypt/`, etc.)
+- Policies: Same endpoints (`sys/policies/acl/`)
+
+No incompatibilities were found for the credential-proxy's use case.
+
+## Namespaces
+
+OpenBao does not support Vault Enterprise namespaces (multi-tenancy). The
+`X-Vault-Namespace` header is still present in the codebase for compatibility,
+but OpenBao is single-tenant. This is not relevant for the credential-proxy
+since we operate in a single-VM environment.
+
+
+# Summary of Findings
+
+| Area | Finding | Impact on credential-proxy |
+|------|---------|---------------------------|
+| KV v2 envelope | `data.data` nesting confirmed in source | Current code handles it correctly |
+| KV v2 typed API | Higher-level `KVv2` client available | Could simplify `FetchCredential` |
+| Versioning | Automatic versioning, CAS support | Credential rotation is transparent |
+| Policy language | HCL path-based ACL with 9 capabilities | `credproxy-readonly` policy already defined |
+| AppRole auth | role_id + secret_id, configurable TTL | Recommended for production deployment |
+| Token renewal | `LifetimeWatcher` with exponential backoff | Should be integrated for long-running service |
+| Periodic tokens | `token_period` bypasses max TTL | Recommended for credential-proxy |
+| Audit logging | HMAC-hashed JSON, file/syslog/socket | Already configured in NixOS module |
+| Transit engine | Envelope encryption available | Not needed now; useful for future caching |
+| NixOS integration | Policy provisioned at build time | Working; AppRole provisioning is future work |
+| Env vars | `BAO_*` with `VAULT_*` fallback | Use `BAO_ADDR` in service config |
+| API compat | HTTP API endpoints identical to Vault | No migration issues |
+
+
+# Recommendations for credential-proxy
+
+## Immediate (Phase 1)
+
+1. **Integrate `LifetimeWatcher` for token renewal.** The proxy is a
+   long-running service and must handle token expiration gracefully.
+
+2. **Add AppRole authentication.** Replace the static `cfg.Token` with AppRole
+   login using `role_id` + `secret_id` from the service configuration.
+
+3. **Use periodic tokens.** Configure `token_period=1h` on the AppRole to avoid
+   max TTL limits.
+
+## Short-Term (Phase 2)
+
+4. **Upgrade to typed KV v2 API.** Replace `Logical().ReadWithContext()` with
+   `KVv2("secret").Get()` for cleaner code and better error handling.
+
+5. **Implement re-authentication.** When `LifetimeWatcher.DoneCh()` fires,
+   automatically re-authenticate via AppRole.
+
+6. **Add AppRole provisioning to NixOS module.** Extend the standalone openbao
+   module to create AppRole roles and manage secret_id rotation.
+
+## Future (Phase 3)
+
+7. **Transit encryption for caching.** If credential caching is added, use the
+   Transit engine for envelope encryption of cached values.
+
+8. **Audit log analysis.** Integrate audit log parsing for anomaly detection on
+   credential access patterns.

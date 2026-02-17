@@ -1,0 +1,1046 @@
+---
+title: "Temporal Go SDK: Idiomatic Patterns for credential-proxy"
+date: "2026-02-17"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Executive Summary
+
+This document captures research findings from exploring the Temporal Go SDK source
+(`go.temporal.io/sdk` v1.x) and mapping idiomatic patterns against the
+credential-proxy codebase. The credential-proxy uses Temporal for two purposes:
+
+1. **AuditWorkflow** -- fire-and-forget recording of request metadata via search
+   attributes (no activities).
+2. **ProxyRequestWorkflow** -- a two-stage orchestration (validate-and-resolve,
+   then fetch-and-forward) with credential isolation via sealed activities.
+
+The research covers eleven focus areas: workflow/activity context, typed search
+attributes, activity options, local activities, async execution patterns, client
+workflow start, the test suite, worker configuration, error handling, interceptors,
+and signal/query.
+
+Key findings:
+
+- The current credential-proxy code is largely idiomatic. Several small
+  improvements would increase robustness and testability.
+- `ValidateAndResolve` is a strong candidate for local activity execution.
+- The audit workflow's fire-and-forget goroutine should use
+  `WorkflowExecutionErrorWhenAlreadyStarted: false` (already the default) but
+  needs a deterministic workflow ID strategy to prevent duplicates.
+- Error handling should use `temporal.NewNonRetryableApplicationError` for
+  authorization denials.
+- The test suite (`testsuite.WorkflowTestSuite`) provides all the mocking
+  infrastructure needed to unit-test both workflows without a running Temporal server.
+
+
+# Focus Area 1: `workflow.Context` vs `context.Context`
+
+## Key Distinction
+
+The Temporal SDK defines its own `workflow.Context` interface
+(`internal.Context`) that mirrors Go's `context.Context` but returns
+`workflow.Channel` from `Done()` instead of a native Go channel. This is
+required for **replay determinism**: the Temporal runtime replays workflow
+history on recovery, and all scheduling decisions (timers, activity starts,
+channel operations) must be deterministic across replays.
+
+```go
+// From internal/context.go
+type Context interface {
+    Deadline() (deadline time.Time, ok bool)
+    Done() Channel          // NOT chan struct{} -- returns workflow.Channel
+    Err() error
+    Value(key interface{}) interface{}
+}
+```
+
+## When to use which
+
+| Situation | Context Type | Why |
+|---|---|---|
+| Workflow function signature | `workflow.Context` | Required for replay determinism |
+| Activity function signature | `context.Context` | Activities are normal Go; no replay |
+| Calling `workflow.ExecuteActivity` | `workflow.Context` to set options | Options are stored on workflow ctx |
+| Getting result with `.Get()` | `workflow.Context` | Blocks on workflow scheduler, not OS |
+| Inside activity: vault fetch, HTTP call | `context.Context` | Standard Go concurrency |
+| `workflow.Now(ctx)` | `workflow.Context` | Deterministic clock |
+| `time.Now()` | Never in workflow code | Non-deterministic; breaks replay |
+
+## Current credential-proxy assessment
+
+The credential-proxy correctly uses `workflow.Context` in workflow code and
+`context.Context` in activity code (`ValidateAndResolve`, `FetchAndForward`).
+This is correct and idiomatic.
+
+**One subtlety**: In `proxy_workflow.go`, the `.Get(ctx, &resolveOutput)` call
+correctly uses the *original* `ctx` (not `validateCtx`) for blocking. Both
+work because `validateCtx` is derived from `ctx`, but the SDK documentation
+examples consistently use the parent context for `.Get()`. The current code is
+correct.
+
+
+# Focus Area 2: UpsertTypedSearchAttributes
+
+## The Typed API
+
+The SDK provides a typed search attribute API that replaced the older untyped
+`map[string]interface{}` approach (now deprecated). The typed API uses
+key constructors:
+
+```go
+// Key constructors from temporal/search_attributes.go
+temporal.NewSearchAttributeKeyString(name)    // SearchAttributeKeyString
+temporal.NewSearchAttributeKeyKeyword(name)   // SearchAttributeKeyKeyword
+temporal.NewSearchAttributeKeyBool(name)      // SearchAttributeKeyBool
+temporal.NewSearchAttributeKeyInt64(name)     // SearchAttributeKeyInt64
+temporal.NewSearchAttributeKeyFloat64(name)   // SearchAttributeKeyFloat64
+temporal.NewSearchAttributeKeyTime(name)      // SearchAttributeKeyTime
+temporal.NewSearchAttributeKeyKeywordList(name) // SearchAttributeKeyKeywordList
+```
+
+Each key type exposes `.ValueSet(val)` to create a `SearchAttributeUpdate` and
+`.ValueUnset()` to remove the attribute:
+
+```go
+var statusKey = temporal.NewSearchAttributeKeyKeyword("CredProxyStatus")
+
+// Set
+workflow.UpsertTypedSearchAttributes(ctx, statusKey.ValueSet("success"))
+
+// Unset
+workflow.UpsertTypedSearchAttributes(ctx, statusKey.ValueUnset())
+```
+
+## Idiomatic pattern: package-level key definitions
+
+The SDK examples and the `workflow.go` documentation show key definitions as
+package-level variables, not constructed inside functions:
+
+```go
+// Idiomatic: keys are package-level constants
+var (
+    agentIDKey   = temporal.NewSearchAttributeKeyString("CredProxyAgentID")
+    domainKey    = temporal.NewSearchAttributeKeyString("CredProxyTargetDomain")
+    credHashKey  = temporal.NewSearchAttributeKeyString("CredProxyCredentialRefHash")
+    statusKey    = temporal.NewSearchAttributeKeyKeyword("CredProxyStatus")
+)
+```
+
+## Current credential-proxy assessment
+
+The current `audit/search_attributes.go` creates keys *inside*
+`ToSearchAttributeUpdates()` on every call via
+`temporal.NewSearchAttributeKeyString(AttrAgentID).ValueSet(...)`. This works
+correctly but is slightly wasteful since keys are stateless value objects.
+
+**Recommendation**: Define keys as package-level `var` declarations. This also
+makes them available for typed queries from the client side.
+
+**Recommendation**: Consider using `SearchAttributeKeyKeyword` for `Status`
+instead of `SearchAttributeKeyString`, since status is a finite enumerated set
+(in_progress, success, denied, error). Keyword attributes support exact-match
+queries which are more efficient for filtering. String attributes are for
+full-text search.
+
+
+# Focus Area 3: Activity Options
+
+## The `ActivityOptions` struct
+
+From `internal/activity.go`:
+
+```go
+type ActivityOptions struct {
+    TaskQueue              string
+    ScheduleToCloseTimeout time.Duration  // Total time including retries
+    ScheduleToStartTimeout time.Duration  // Time in queue before picked up
+    StartToCloseTimeout    time.Duration  // Single execution attempt
+    HeartbeatTimeout       time.Duration  // Max time between heartbeats
+    WaitForCancellation    bool
+    ActivityID             string
+    RetryPolicy            *RetryPolicy
+    DisableEagerExecution  bool
+    Summary                string         // Experimental: UI display
+    Priority               Priority       // Experimental: queue priority
+}
+```
+
+## Timeout relationships
+
+The SDK documentation specifies these rules:
+
+1. **At least one of** `ScheduleToCloseTimeout` or `StartToCloseTimeout` is
+   **required**.
+2. `ScheduleToCloseTimeout` bounds the *total* time including all retries.
+3. `StartToCloseTimeout` bounds a *single* attempt.
+4. `ScheduleToStartTimeout` is almost never needed (only for host-specific routing).
+5. `HeartbeatTimeout` enables the server to detect a stuck activity. If not set,
+   the server relies on `StartToCloseTimeout` to detect failure.
+
+## RetryPolicy fields
+
+From `internal/client.go`:
+
+```go
+type RetryPolicy struct {
+    InitialInterval    time.Duration  // Default: 1s
+    BackoffCoefficient float64        // Default: 2.0
+    MaximumInterval    time.Duration  // Default: 100x InitialInterval
+    MaximumAttempts    int32          // Default: 0 (unlimited)
+    NonRetryableErrorTypes []string   // Error types that stop retry
+}
+```
+
+**Important**: Setting `MaximumAttempts` to 1 disables retries entirely.
+
+## Current credential-proxy assessment
+
+```go
+// Current: ValidateAndResolve
+workflow.ActivityOptions{
+    StartToCloseTimeout: 10 * time.Second,
+    RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 2},
+}
+
+// Current: FetchAndForward
+workflow.ActivityOptions{
+    StartToCloseTimeout: 30 * time.Second,
+    RetryPolicy: &temporal.RetryPolicy{MaximumAttempts: 2},
+}
+```
+
+The current code uses `StartToCloseTimeout` without `ScheduleToCloseTimeout`,
+which is valid. The SDK defaults `ScheduleToCloseTimeout` to unlimited in
+this case, meaning retries are bounded only by `MaximumAttempts`.
+
+**Recommendation**: Add `ScheduleToCloseTimeout` as an outer bound. For
+`FetchAndForward`, a `ScheduleToCloseTimeout` of 60 seconds prevents a
+worst-case scenario of two 30-second attempts consuming 60 seconds total
+(which is fine), but provides explicit documentation of the intent.
+
+**Recommendation**: For `FetchAndForward`, consider adding `HeartbeatTimeout`
+(e.g., 15 seconds) with `activity.RecordHeartbeat(ctx)` calls. This enables
+the server to detect a hung HTTP request faster than waiting for the full
+`StartToCloseTimeout` to expire. The current `http.Client.Timeout` of 30s
+in `main.go` already bounds the HTTP request, but heartbeating lets Temporal
+detect worker process crashes separately.
+
+
+# Focus Area 4: Local Activities
+
+## What are local activities?
+
+From `workflow/workflow.go`:
+
+```go
+// ExecuteLocalActivity requests to run a local activity. Key differences:
+// - Scheduled and run by the workflow worker locally.
+// - Does not need Temporal server to schedule activity task.
+// - No need to register local activity.
+// - For short living activities (usually finishes within seconds).
+// - Cannot heartbeat.
+```
+
+Local activities execute in-process on the workflow worker, avoiding the
+round-trip to the Temporal server for scheduling. The result is still recorded
+in workflow history (serialized via the data converter).
+
+## When to use local activities
+
+| Criterion | Regular Activity | Local Activity |
+|---|---|---|
+| Duration | Any | Short (seconds) |
+| Needs server scheduling | Yes | No |
+| Can heartbeat | Yes | No |
+| Needs separate task queue | Can specify | No |
+| Round-trip to server | Required | Avoided |
+| Input serialization | Required | Skipped (same process) |
+| Result serialization | Required | Required (for replay) |
+| Registration | Required | Not required |
+
+## `LocalActivityOptions`
+
+```go
+type LocalActivityOptions struct {
+    ScheduleToCloseTimeout time.Duration  // Total including retries
+    StartToCloseTimeout    time.Duration  // Single attempt
+    RetryPolicy            *RetryPolicy
+    Summary                string         // Experimental
+}
+```
+
+Note: `ScheduleToCloseTimeout` should be shorter than the workflow task timeout
+(default 10 seconds). If a local activity takes longer, the workflow task will
+time out and be retried, causing the local activity to also be retried.
+
+## Current credential-proxy assessment: ValidateAndResolve
+
+`ValidateAndResolve` is a strong candidate for local activity because:
+
+1. It performs only in-memory config lookup and OPA policy evaluation.
+2. It completes in milliseconds under normal conditions.
+3. It does not make external network calls (OPA is evaluated locally).
+4. It runs on the same worker that executes the workflow.
+
+```go
+// Recommended: Use local activity for ValidateAndResolve
+localCtx := workflow.WithLocalActivityOptions(ctx, workflow.LocalActivityOptions{
+    ScheduleToCloseTimeout: 5 * time.Second,
+    RetryPolicy: &temporal.RetryPolicy{
+        MaximumAttempts: 2,
+    },
+})
+
+var resolveOutput ValidateAndResolveOutput
+err := workflow.ExecuteLocalActivity(localCtx, (*Activities).ValidateAndResolve, input).Get(ctx, &resolveOutput)
+```
+
+**Caveat**: If OPA evaluation makes network calls (e.g., fetching bundles from
+a remote server), then it should remain a regular activity. The decision depends
+on the `authz.Evaluator` implementation.
+
+`FetchAndForward` should **not** be a local activity because:
+
+1. It makes external HTTP calls (potentially slow).
+2. It fetches secrets from vault (network I/O).
+3. It benefits from heartbeating for crash detection.
+
+
+# Focus Area 5: `workflow.ExecuteActivity` Patterns
+
+## Synchronous (blocking) pattern
+
+The most common pattern is to call `.Get()` immediately, blocking until the
+activity completes:
+
+```go
+var result MyOutput
+err := workflow.ExecuteActivity(ctx, myActivity, input).Get(ctx, &result)
+if err != nil {
+    // handle error
+}
+```
+
+## Asynchronous (future) pattern
+
+`ExecuteActivity` returns a `workflow.Future` immediately. Multiple activities
+can be started in parallel:
+
+```go
+future1 := workflow.ExecuteActivity(ctx, activity1, input1)
+future2 := workflow.ExecuteActivity(ctx, activity2, input2)
+
+var result1 Output1
+var result2 Output2
+err1 := future1.Get(ctx, &result1)
+err2 := future2.Get(ctx, &result2)
+```
+
+## Selector pattern for non-blocking select
+
+```go
+selector := workflow.NewSelector(ctx)
+selector.AddFuture(future1, func(f workflow.Future) {
+    err := f.Get(ctx, &result1)
+    // handle
+})
+selector.AddFuture(future2, func(f workflow.Future) {
+    err := f.Get(ctx, &result2)
+    // handle
+})
+selector.Select(ctx)  // blocks until one completes
+selector.Select(ctx)  // blocks until the other completes
+```
+
+## Method reference pattern for struct activities
+
+The SDK supports calling methods on a struct pointer for activities:
+
+```go
+// Option A: nil receiver (preferred in workflow code)
+var a *Activities
+workflow.ExecuteActivity(ctx, a.ValidateAndResolve, input)
+
+// Option B: explicit method expression (also valid)
+workflow.ExecuteActivity(ctx, (*Activities).ValidateAndResolve, input)
+```
+
+The current credential-proxy uses Option B (`(*Activities).ValidateAndResolve`),
+which is valid and appears in the SDK's own documentation examples.
+
+## Current credential-proxy assessment
+
+The current code uses the synchronous blocking pattern for both activities,
+which is correct since they are sequential (step 2 depends on step 1's output).
+No change needed.
+
+
+# Focus Area 6: `client.ExecuteWorkflow`
+
+## Client interface
+
+```go
+// From internal/client.go
+ExecuteWorkflow(ctx context.Context, options StartWorkflowOptions,
+    workflow interface{}, args ...interface{}) (WorkflowRun, error)
+```
+
+`ExecuteWorkflow` starts a workflow execution asynchronously and returns a
+`WorkflowRun`. The workflow is *already running* when this returns. To get
+the result, call `run.Get(ctx, &result)` which blocks until completion.
+
+## `StartWorkflowOptions` key fields
+
+```go
+type StartWorkflowOptions struct {
+    ID                       string             // Business identifier; default: UUID
+    TaskQueue                string             // Required
+    WorkflowExecutionTimeout time.Duration      // Total including retries+CAN
+    WorkflowRunTimeout       time.Duration      // Single run
+    WorkflowTaskTimeout      time.Duration      // Default: 10s
+    WorkflowIDConflictPolicy enumspb.WorkflowIdConflictPolicy
+    WorkflowIDReusePolicy    enumspb.WorkflowIdReusePolicy
+    WorkflowExecutionErrorWhenAlreadyStarted bool
+    RetryPolicy              *RetryPolicy
+    // ... CronSchedule, Memo, SearchAttributes, etc.
+}
+```
+
+## Workflow ID strategies
+
+The SDK defaults workflow ID to a UUID if not set. However, setting a
+deterministic ID enables **deduplication**: if a workflow with the same ID
+is already running, the behavior depends on `WorkflowIDConflictPolicy`:
+
+- `FAIL` (default): Returns error if running workflow exists.
+- `USE_EXISTING`: Returns the existing run handle.
+- `TERMINATE_IF_RUNNING`: Terminates the existing and starts new.
+
+## Current credential-proxy assessment
+
+The audit workflow start in `handlers.go`:
+
+```go
+wfID := fmt.Sprintf("credproxy-%s-%d", identity.Subject, time.Now().UnixNano())
+_, err := gw.temporal.ExecuteWorkflow(context.Background(), temporalclient.StartWorkflowOptions{
+    ID:        wfID,
+    TaskQueue: gw.cfg.Temporal.TaskQueue,
+}, workflows.AuditWorkflow, workflows.ProxyWorkflowInput{...})
+```
+
+**Issue 1**: Using `time.Now().UnixNano()` generates unique IDs that prevent
+deduplication. If the same request is retried, it creates a duplicate audit
+record. Consider using a hash of the request content for idempotency.
+
+**Issue 2**: The fire-and-forget pattern uses `context.Background()`, which is
+correct (the caller should not cancel the workflow start). However, the error
+is only logged, which is also correct for fire-and-forget audit.
+
+**Issue 3**: No `WorkflowExecutionTimeout` is set. For audit workflows that
+only upsert search attributes (no activities), the workflow completes nearly
+instantly. Adding `WorkflowExecutionTimeout: 30 * time.Second` provides a
+safety bound.
+
+**Recommendation**: Use a deterministic workflow ID based on request content
+for idempotent audit recording:
+
+```go
+wfID := fmt.Sprintf("audit-%s-%s-%s-%s",
+    identity.Subject, targetDomain, req.Method, requestContentHash)
+
+_, err := gw.temporal.ExecuteWorkflow(context.Background(), temporalclient.StartWorkflowOptions{
+    ID:        wfID,
+    TaskQueue: gw.cfg.Temporal.TaskQueue,
+    WorkflowExecutionTimeout: 30 * time.Second,
+    WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+}, workflows.AuditWorkflow, input)
+```
+
+
+# Focus Area 7: Test Suite (`go.temporal.io/sdk/testsuite`)
+
+## Architecture
+
+The test suite provides an in-memory workflow execution environment that does
+not require a running Temporal server. It is built on top of `testify/mock`:
+
+```go
+type WorkflowTestSuite  = internal.WorkflowTestSuite
+type TestWorkflowEnvironment = internal.TestWorkflowEnvironment
+type TestActivityEnvironment = internal.TestActivityEnvironment
+type MockCallWrapper = internal.MockCallWrapper
+```
+
+## Basic workflow test pattern
+
+```go
+func TestProxyRequestWorkflow(t *testing.T) {
+    testSuite := &testsuite.WorkflowTestSuite{}
+    env := testSuite.NewTestWorkflowEnvironment()
+
+    // Register workflow and activities
+    env.RegisterWorkflow(workflows.ProxyRequestWorkflow)
+    env.RegisterActivity(&workflows.Activities{})
+
+    // Mock activities
+    env.OnActivity((*workflows.Activities).ValidateAndResolve, mock.Anything, mock.Anything).
+        Return(&workflows.ValidateAndResolveOutput{
+            CredentialPaths: map[string]string{"hash1": "secret/path"},
+        }, nil).Once()
+
+    env.OnActivity((*workflows.Activities).FetchAndForward, mock.Anything, mock.Anything).
+        Return(&workflows.FetchAndForwardOutput{
+            StatusCode:       200,
+            BytesTransferred: 1024,
+        }, nil).Once()
+
+    // Execute
+    env.ExecuteWorkflow(workflows.ProxyRequestWorkflow, workflows.ProxyWorkflowInput{
+        AgentID:           "agent-1",
+        RequestID:         "req-1",
+        TargetDomain:      "api.example.com",
+        Method:            "GET",
+        Path:              "/v1/data",
+        PlaceholderHashes: []string{"hash1"},
+    })
+
+    // Assert
+    require.True(t, env.IsWorkflowCompleted())
+    require.NoError(t, env.GetWorkflowError())
+
+    var result workflows.ProxyWorkflowOutput
+    require.NoError(t, env.GetWorkflowResult(&result))
+    require.Equal(t, workflows.StatusSuccess, result.Status)
+    require.Equal(t, int64(1024), result.BytesTransferred)
+
+    env.AssertExpectations(t)
+}
+```
+
+## Mocking activity failures
+
+```go
+env.OnActivity((*workflows.Activities).ValidateAndResolve, mock.Anything, mock.Anything).
+    Return(nil, fmt.Errorf("access denied: policy violation")).Once()
+```
+
+## Testing the AuditWorkflow (no activities)
+
+```go
+func TestAuditWorkflow(t *testing.T) {
+    testSuite := &testsuite.WorkflowTestSuite{}
+    env := testSuite.NewTestWorkflowEnvironment()
+
+    env.RegisterWorkflow(workflows.AuditWorkflow)
+
+    env.ExecuteWorkflow(workflows.AuditWorkflow, workflows.ProxyWorkflowInput{
+        AgentID:           "agent-1",
+        RequestID:         "req-audit",
+        TargetDomain:      "api.example.com",
+        Method:            "POST",
+        Path:              "/v1/submit",
+        PlaceholderHashes: []string{"hash1"},
+    })
+
+    require.True(t, env.IsWorkflowCompleted())
+    require.NoError(t, env.GetWorkflowError())
+
+    var result workflows.ProxyWorkflowOutput
+    require.NoError(t, env.GetWorkflowResult(&result))
+    require.Equal(t, workflows.StatusSuccess, result.Status)
+}
+```
+
+## Testing activities directly
+
+```go
+func TestValidateAndResolve(t *testing.T) {
+    testSuite := &testsuite.WorkflowTestSuite{}
+    env := testSuite.NewTestActivityEnvironment()
+
+    activities := &workflows.Activities{
+        Config:    testConfig,
+        Evaluator: mockEvaluator,
+    }
+    env.RegisterActivity(activities)
+
+    result, err := env.ExecuteActivity(
+        activities.ValidateAndResolve,
+        workflows.ValidateAndResolveInput{
+            AgentID:           "agent-1",
+            TargetDomain:      "api.example.com",
+            PlaceholderHashes: []string{"hash1"},
+        },
+    )
+    require.NoError(t, err)
+
+    var output workflows.ValidateAndResolveOutput
+    require.NoError(t, result.Get(&output))
+    require.Contains(t, output.CredentialPaths, "hash1")
+}
+```
+
+## Key TestWorkflowEnvironment methods
+
+| Method | Purpose |
+|---|---|
+| `RegisterWorkflow(w)` | Register workflow for execution |
+| `RegisterActivity(a)` | Register activity (struct or func) |
+| `OnActivity(fn, args...).Return(...)` | Mock activity with testify/mock |
+| `OnWorkflow(fn, args...).Return(...)` | Mock child workflow |
+| `ExecuteWorkflow(fn, args...)` | Run the workflow |
+| `IsWorkflowCompleted()` | Check if workflow finished |
+| `GetWorkflowError()` | Get workflow error |
+| `GetWorkflowResult(&val)` | Decode workflow result |
+| `AssertExpectations(t)` | Verify all mock expectations met |
+| `SetWorkerOptions(opts)` | Configure worker options for test |
+| `SetOnActivityStartedListener(fn)` | Hook into activity lifecycle |
+| `SetOnActivityCompletedListener(fn)` | Hook into activity lifecycle |
+
+
+# Focus Area 8: Worker Configuration
+
+## `worker.Options` key fields
+
+From `internal/worker.go`:
+
+```go
+type WorkerOptions struct {
+    MaxConcurrentActivityExecutionSize      int  // default: 1000
+    WorkerActivitiesPerSecond               float64
+    MaxConcurrentLocalActivityExecutionSize int  // default: 1000
+    WorkerLocalActivitiesPerSecond          float64
+    MaxConcurrentActivityTaskPollers        int  // default: 2
+    MaxConcurrentWorkflowTaskExecutionSize  int  // default: 1000
+    MaxConcurrentWorkflowTaskPollers        int  // default: 2
+    WorkerStopTimeout                       time.Duration
+    OnFatalError                            func(error)
+    // ... many more
+}
+```
+
+## Current credential-proxy assessment
+
+```go
+// Current: uses all defaults
+w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{})
+```
+
+For a credential-proxy that handles individual proxied requests, the defaults
+are reasonable. However, some tuning may be appropriate:
+
+**Recommendation**: Set `MaxConcurrentActivityExecutionSize` to limit concurrent
+vault/HTTP operations. If the proxy handles bursty traffic, unbounded concurrent
+activities could overwhelm the vault or upstream APIs.
+
+```go
+w := worker.New(tc, cfg.Temporal.TaskQueue, worker.Options{
+    MaxConcurrentActivityExecutionSize: 50,
+    OnFatalError: func(err error) {
+        slog.Error("temporal worker fatal error", "error", err)
+    },
+})
+```
+
+**Recommendation**: Set `OnFatalError` to log fatal errors. Without this,
+fatal errors during worker operation are silently swallowed (only
+`worker.Start()` returns startup errors).
+
+
+# Focus Area 9: Error Handling
+
+## Error type hierarchy
+
+The SDK defines a structured error hierarchy for activities:
+
+```
+*ActivityError (wraps one of):
+    *ApplicationError    -- activity returned an error
+    *CanceledError       -- activity was canceled
+    *TimeoutError        -- activity timed out
+    *PanicError          -- activity panicked
+```
+
+## Creating application errors
+
+```go
+// Retryable error (default)
+temporal.NewApplicationError("message", "ErrorType", details...)
+
+// Non-retryable error (stops retry immediately)
+temporal.NewNonRetryableApplicationError("access denied", "AuthzDenied", cause)
+
+// With cause and options
+temporal.NewApplicationErrorWithOptions("msg", "Type", temporal.ApplicationErrorOptions{
+    NonRetryable: true,
+    Cause:        originalErr,
+    Details:      []interface{}{detail1, detail2},
+})
+```
+
+## Handling errors in workflow code
+
+```go
+err := workflow.ExecuteActivity(ctx, myActivity, input).Get(ctx, &result)
+if err != nil {
+    var appErr *temporal.ApplicationError
+    if errors.As(err, &appErr) {
+        switch appErr.Type() {
+        case "AuthzDenied":
+            return finalize(ctx, start, StatusDenied, 0, err)
+        default:
+            return finalize(ctx, start, StatusError, 0, err)
+        }
+    }
+
+    var timeoutErr *temporal.TimeoutError
+    if errors.As(err, &timeoutErr) {
+        // handle timeout
+    }
+}
+```
+
+## Using `NonRetryableErrorTypes` in RetryPolicy
+
+```go
+RetryPolicy: &temporal.RetryPolicy{
+    MaximumAttempts:        3,
+    NonRetryableErrorTypes: []string{"AuthzDenied", "InvalidInput"},
+}
+```
+
+## Current credential-proxy assessment
+
+The activities currently return plain `fmt.Errorf(...)` errors. These are
+wrapped by Temporal as retryable `ApplicationError` with the original error
+type name. This works but loses the ability to distinguish retriable from
+non-retriable failures.
+
+**Recommendation**: Use `temporal.NewNonRetryableApplicationError` for
+authorization denials in `ValidateAndResolve`:
+
+```go
+// Current
+return nil, fmt.Errorf("access denied: %s", result.Reason)
+
+// Recommended
+return nil, temporal.NewNonRetryableApplicationError(
+    fmt.Sprintf("access denied: %s", result.Reason),
+    "AuthzDenied",
+    nil, // no cause
+)
+```
+
+This immediately stops retries for authorization failures (which will not
+succeed on retry) while preserving retry for transient errors like vault
+connectivity issues.
+
+Similarly, for unknown placeholders:
+
+```go
+return nil, temporal.NewNonRetryableApplicationError(
+    fmt.Sprintf("unknown placeholder: %s", hash),
+    "UnknownPlaceholder",
+    nil,
+)
+```
+
+## `workflow.GetInfo` for debugging
+
+```go
+info := workflow.GetInfo(ctx)
+// info.WorkflowExecution.ID, info.WorkflowExecution.RunID
+// info.Attempt, info.WorkflowType.Name, info.TaskQueueName
+```
+
+The current `finalize` function does not use `workflow.GetInfo`. If
+extended logging is needed, this provides workflow execution context.
+
+
+# Focus Area 10: Interceptors
+
+## Architecture
+
+The interceptor system provides layered interception for both client and worker
+operations. There are three layers:
+
+1. **ClientInterceptor** -- intercepts outbound client calls (`ExecuteWorkflow`,
+   `SignalWorkflow`, `QueryWorkflow`).
+2. **WorkerInterceptor** -- intercepts inbound/outbound workflow and activity
+   calls.
+3. **Interceptor** -- combines both (implements `ClientInterceptor` +
+   `WorkerInterceptor`).
+
+```go
+// From interceptor/interceptor.go
+type Interceptor = internal.Interceptor           // Combined
+type ClientInterceptor = internal.ClientInterceptor
+type WorkerInterceptor = internal.WorkerInterceptor
+
+// Base types for embedding
+type InterceptorBase = internal.InterceptorBase
+type ClientInterceptorBase = internal.ClientInterceptorBase
+type WorkerInterceptorBase = internal.WorkerInterceptorBase
+```
+
+## Registration
+
+```go
+// On client (intercepts client calls + optionally worker calls)
+tc, err := client.Dial(client.Options{
+    Interceptors: []interceptor.ClientInterceptor{myInterceptor},
+})
+
+// On worker (intercepts only worker calls)
+w := worker.New(tc, taskQueue, worker.Options{
+    Interceptors: []interceptor.WorkerInterceptor{myWorkerInterceptor},
+})
+```
+
+## Built-in: TracingInterceptor
+
+The SDK provides a tracing interceptor (`interceptor/tracing_interceptor.go`)
+that propagates trace context through workflow headers:
+
+```go
+tracer := opentelemetry.NewTracer(...)
+tracingInterceptor, err := interceptor.NewTracingInterceptor(
+    interceptor.TracerOptions{...}, tracer,
+)
+
+tc, err := client.Dial(client.Options{
+    Interceptors: []interceptor.ClientInterceptor{tracingInterceptor},
+})
+```
+
+## Custom interceptor example
+
+A simple logging interceptor:
+
+```go
+type loggingInterceptor struct {
+    interceptor.InterceptorBase
+    logger *slog.Logger
+}
+
+func (l *loggingInterceptor) InterceptClient(next interceptor.ClientOutboundInterceptor) interceptor.ClientOutboundInterceptor {
+    return &loggingClientOutbound{
+        ClientOutboundInterceptorBase: interceptor.ClientOutboundInterceptorBase{Next: next},
+        logger: l.logger,
+    }
+}
+
+type loggingClientOutbound struct {
+    interceptor.ClientOutboundInterceptorBase
+    logger *slog.Logger
+}
+
+func (l *loggingClientOutbound) ExecuteWorkflow(ctx context.Context, in *interceptor.ClientExecuteWorkflowInput) (client.WorkflowRun, error) {
+    l.logger.Info("starting workflow", "workflow_id", in.Options.ID)
+    return l.Next.ExecuteWorkflow(ctx, in)
+}
+```
+
+## Current credential-proxy assessment
+
+The credential-proxy does not use interceptors. This is fine for the current
+scope. Interceptors become valuable when:
+
+- Adding distributed tracing (OpenTelemetry).
+- Adding custom metrics for workflow/activity execution.
+- Adding request-scoped context propagation.
+
+**Recommendation (future)**: When the credential-proxy adds OpenTelemetry, use
+the tracing interceptor from `go.temporal.io/contrib/opentelemetry` to
+propagate trace context from the proxy HTTP handler through the Temporal
+workflow and activities.
+
+
+# Focus Area 11: Signal and Query
+
+## Signals
+
+Signals deliver data to a running workflow asynchronously. The workflow
+registers a signal channel and receives values from it:
+
+```go
+// In workflow code
+func MyWorkflow(ctx workflow.Context) error {
+    ch := workflow.GetSignalChannel(ctx, "my-signal")
+
+    var signalVal string
+    ch.Receive(ctx, &signalVal)
+    // process signal
+}
+
+// From client code
+err := client.SignalWorkflow(ctx, workflowID, "", "my-signal", "signal-data")
+```
+
+## Queries
+
+Queries read workflow state synchronously without modifying it:
+
+```go
+// In workflow code
+func MyWorkflow(ctx workflow.Context) error {
+    currentState := "started"
+
+    err := workflow.SetQueryHandler(ctx, "current_state", func() (string, error) {
+        return currentState, nil
+    })
+    // ... workflow logic that updates currentState
+}
+
+// From client code
+val, err := client.QueryWorkflow(ctx, workflowID, "", "current_state")
+var state string
+err = val.Get(&state)
+```
+
+**Important constraints for query handlers**:
+- Must NOT use workflow context for blocking operations.
+- Must NOT mutate workflow state.
+- Must be deterministic.
+- Must return quickly.
+
+## Updates (newer API)
+
+Updates combine signal (mutates state) and query (returns result) in one
+round-trip. The workflow registers an update handler with an optional validator:
+
+```go
+workflow.SetUpdateHandlerWithOptions(ctx, "add-item",
+    func(ctx workflow.Context, item string) (int, error) {
+        items = append(items, item)
+        return len(items), nil
+    },
+    workflow.UpdateHandlerOptions{
+        Validator: func(item string) error {
+            if item == "" { return fmt.Errorf("empty item") }
+            return nil
+        },
+    },
+)
+```
+
+## Current credential-proxy assessment
+
+The credential-proxy does not use signals, queries, or updates. For the current
+fire-and-forget audit workflow, this is correct. However, for the
+`ProxyRequestWorkflow`, queries could be useful for observability:
+
+```go
+// Potential future: query workflow status
+err := workflow.SetQueryHandler(ctx, "proxy-status", func() (string, error) {
+    return string(currentStatus), nil
+})
+```
+
+This would allow external monitoring to query the current phase of a long-running
+proxy request without relying solely on search attribute visibility lag.
+
+
+# Comparison: Current Code vs Idiomatic SDK Patterns
+
+| Area | Current Code | Idiomatic Pattern | Gap | Priority |
+|---|---|---|---|---|
+| Search attribute keys | Created per-call in `ToSearchAttributeUpdates()` | Package-level `var` declarations | Minor efficiency | Low |
+| Search attribute type | All `KeyString` | `KeyKeyword` for `Status` (finite enum) | Query efficiency | Medium |
+| Activity error types | `fmt.Errorf()` | `temporal.NewNonRetryableApplicationError` for authz denial | Retry semantics | High |
+| `ValidateAndResolve` execution | Regular activity | Local activity (if no network I/O) | Latency optimization | Medium |
+| Worker options | All defaults | Set `MaxConcurrentActivityExecutionSize`, `OnFatalError` | Operational safety | Medium |
+| Audit workflow ID | `time.Now().UnixNano()` (non-deterministic) | Deterministic hash-based ID for dedup | Idempotency | High |
+| Audit workflow timeout | Not set | `WorkflowExecutionTimeout: 30s` | Safety bound | Low |
+| Activity `ScheduleToCloseTimeout` | Not set | Set as outer timeout bound | Documentation of intent | Low |
+| Heartbeat for `FetchAndForward` | Not used | `HeartbeatTimeout` + `RecordHeartbeat` | Crash detection speed | Low |
+| Test coverage | No workflow tests | Use `testsuite.TestWorkflowEnvironment` | Testability | High |
+
+
+# Testing Patterns Summary
+
+## Recommended test structure for credential-proxy
+
+```
+credential-proxy/
+  workflows/
+    proxy_workflow.go
+    proxy_workflow_test.go    <-- workflow unit tests
+    activities.go
+    activities_test.go        <-- activity unit tests
+  audit/
+    search_attributes.go
+    search_attributes_test.go
+```
+
+## Key test scenarios
+
+### `proxy_workflow_test.go`
+
+1. **Happy path**: Both activities succeed, result is `StatusSuccess`.
+2. **Authz denial**: `ValidateAndResolve` returns error, result is `StatusDenied`.
+3. **Fetch failure**: `FetchAndForward` returns error, result is `StatusError`.
+4. **Search attribute upsert**: Verify search attributes are set on completion.
+
+### `activities_test.go`
+
+1. **ValidateAndResolve happy path**: Known placeholders, policy allows.
+2. **ValidateAndResolve unknown placeholder**: Returns error.
+3. **ValidateAndResolve policy denial**: OPA returns deny.
+4. **FetchAndForward happy path**: Vault returns secrets, upstream returns 200.
+5. **FetchAndForward vault error**: Store returns error.
+6. **FetchAndForward nil dependencies**: Returns error for nil Store/HTTPClient.
+
+### `audit_workflow_test.go`
+
+1. **AuditWorkflow completes**: Returns `StatusSuccess` with search attributes.
+
+## Test dependencies
+
+Activities tests require mockable interfaces:
+- `vault.SecretStore` (already an interface)
+- `authz.Evaluator` (already an interface)
+- `*config.Config` (concrete; pass a test config value)
+- `*http.Client` (concrete; use `httptest.Server` or mock transport)
+
+
+# Summary of Recommendations
+
+| # | Recommendation | Impact | Effort |
+|---|---|---|---|
+| 1 | Use `temporal.NewNonRetryableApplicationError` for authz denials | Stops wasteful retries | Low |
+| 2 | Add workflow unit tests using `testsuite.TestWorkflowEnvironment` | Catches regressions without Temporal server | Medium |
+| 3 | Use deterministic workflow ID for audit workflows | Prevents duplicate audit records | Low |
+| 4 | Promote search attribute keys to package-level vars | Cleaner code, reusable for queries | Low |
+| 5 | Use `SearchAttributeKeyKeyword` for Status | Better query performance | Low |
+| 6 | Consider local activity for `ValidateAndResolve` | Reduces latency by ~1 round-trip | Low |
+| 7 | Set `OnFatalError` on worker options | Observable fatal errors | Low |
+| 8 | Set `MaxConcurrentActivityExecutionSize` | Prevents vault/upstream overload | Low |
+| 9 | Add `HeartbeatTimeout` to `FetchAndForward` | Faster crash detection | Low |
+| 10 | Add `WorkflowExecutionTimeout` to audit workflow start | Safety bound | Low |
+
+# Appendix: SDK Package Topology
+
+```
+go.temporal.io/sdk/
+  client/          -- Client interface (ExecuteWorkflow, Signal, Query)
+  workflow/        -- Workflow context, ExecuteActivity, deterministic wrappers
+  activity/        -- Activity info, heartbeat, GetClient
+  worker/          -- Worker lifecycle, Options, tuning
+  temporal/        -- Error types, RetryPolicy, SearchAttributeKey types
+  testsuite/       -- TestWorkflowEnvironment, TestActivityEnvironment
+  interceptor/     -- Client/Worker/Activity interceptor interfaces, TracingInterceptor
+  converter/       -- Data converter, EncodedValue
+  log/             -- Logger interface
+  internal/        -- All actual implementations (public packages are thin wrappers)
+  contrib/         -- Community: opentelemetry, tally, datadog
+```
+
+The public packages (`client/`, `workflow/`, etc.) are thin type alias wrappers
+over `internal/`. This is by design: it allows the SDK team to refactor
+internals without breaking the public API.

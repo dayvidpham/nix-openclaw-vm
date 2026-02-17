@@ -1,0 +1,707 @@
+---
+title: "Keycloak OIDC/OAuth2 Research for credential-proxy"
+date: "2026-02-17"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Executive Summary
+
+This document captures the findings from a source-level investigation of the
+Keycloak codebase (commit `4253a79`, upstream `main`) and its alignment with
+the credential-proxy project's authentication and authorization pipeline. The
+credential-proxy is a Go MITM forward proxy that sits between a guest VM and
+its host, authenticating AI agent requests via Keycloak-issued OIDC JWTs and
+authorizing them through OPA policy evaluation.
+
+Key findings:
+
+- **Realms** provide complete tenant isolation with independent users, clients, roles, groups, and signing keys -- ideal for per-VM or per-project agent isolation.
+- **Client Credentials Grant** (`client_credentials`) is the correct flow for service accounts (AI agents) -- no interactive login required. Keycloak creates a synthetic `service-account-<clientId>` user that can hold roles and groups.
+- **Token structure** is well-defined: `realm_access.roles`, `resource_access.<clientId>.roles`, and `groups` are all standard Keycloak claims with dedicated protocol mappers.
+- The existing `authn/oidc.go` code is architecturally sound but has a critical gap: **audience verification** needs careful configuration because `client_credentials` tokens default to `azp = clientId` but `aud` may not include the proxy's expected audience.
+- **NixOS has a first-class Keycloak module** (`services.keycloak`) that supports realm import via JSON files, eliminating the need for Admin API scripting in the NixOS module.
+- **Token exchange** (RFC 8693) is available but requires the `TOKEN_EXCHANGE` or `TOKEN_EXCHANGE_STANDARD_V2` feature flag and is likely not needed for the current architecture.
+
+
+# Realm Configuration
+
+## What a Realm Provides
+
+A Keycloak realm is the top-level isolation boundary. Each realm has its own:
+
+- **Signing keys**: Independent RSA/EC key pairs for JWS. The JWKS endpoint is per-realm.
+- **Users and service accounts**: Users in realm A cannot authenticate in realm B.
+- **Clients**: Each OIDC client is scoped to a realm.
+- **Roles**: Realm-level roles (`realm_access.roles`) and client-level roles (`resource_access.<clientId>.roles`).
+- **Groups**: Hierarchical group trees with path-based membership.
+- **Client scopes and protocol mappers**: Control which claims appear in tokens.
+- **Token lifetimes and policies**: Each realm configures its own access token TTL, refresh token policy, etc.
+
+## URL Structure (from source)
+
+From `OIDCLoginProtocolService.java` and `OIDCWellKnownProvider.java`:
+
+```
+Base:          {scheme}://{host}/realms/{realm-name}
+Discovery:     {base}/.well-known/openid-configuration
+Token:         {base}/protocol/openid-connect/token
+JWKS:          {base}/protocol/openid-connect/certs
+UserInfo:      {base}/protocol/openid-connect/userinfo
+Introspection: {base}/protocol/openid-connect/token/introspect
+Revocation:    {base}/protocol/openid-connect/revoke
+Logout:        {base}/protocol/openid-connect/logout
+```
+
+The issuer claim in tokens is `{scheme}://{host}/realms/{realm-name}`, set in
+`Urls.realmIssuer()` and confirmed in `OIDCWellKnownProvider.getConfig()` at
+line 116.
+
+## Implications for credential-proxy
+
+The current `OIDCConfig.IssuerURL` field maps directly to the realm URL:
+
+```yaml
+oidc:
+  issuer_url: "http://127.0.0.1:8080/realms/openclaw"
+  audience: "credential-proxy"
+```
+
+Each guest VM realm gets independent keys, so a compromised token from one
+realm cannot verify against another's JWKS. This is the correct isolation
+model for multi-tenant agent deployments.
+
+
+# Client Credentials Grant
+
+## How It Works (from source)
+
+The `ClientCredentialsGrantType.java` implementation (line 55-168) reveals the
+exact flow:
+
+1. **Client authentication**: The client must be confidential (not public, not
+   bearer-only) with `serviceAccountsEnabled = true`. Lines 63-77 enforce
+   these preconditions.
+
+2. **Service account user lookup**: Keycloak looks up the synthetic user via
+   `session.users().getServiceAccount(client)`. This user is named
+   `service-account-{clientId}` (from `ServiceAccountConstants.SERVICE_ACCOUNT_USER_PREFIX`).
+
+3. **Session creation**: A user session is created for the service account
+   user. If refresh tokens are disabled (the default for `client_credentials`),
+   the session is `TRANSIENT` (not persisted to the database), reducing
+   storage overhead.
+
+4. **Token generation**: Standard `TokenManager` pipeline runs, applying all
+   configured protocol mappers (realm roles, client roles, groups, audience,
+   etc.).
+
+## Token Request
+
+```bash
+curl -X POST \
+  "http://localhost:8080/realms/openclaw/protocol/openid-connect/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=agent-worker-1" \
+  -d "client_secret=<secret>"
+```
+
+Response:
+
+```json
+{
+  "access_token": "<JWT>",
+  "expires_in": 300,
+  "token_type": "Bearer",
+  "not-before-policy": 0,
+  "scope": "profile email"
+}
+```
+
+Note: No `refresh_token` by default. The `OIDCAdvancedConfigWrapper` has a
+`isUseRefreshTokenForClientCredentialsGrant()` method that can be enabled per
+client if needed, but for short-lived agent tokens this is unnecessary.
+
+## Alignment with credproxy-auth.sh
+
+The existing `credproxy-auth.sh` script (lines 49-55) correctly implements
+this flow:
+
+```bash
+curl --silent --show-error --fail \
+  --request POST \
+  --header "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=client_credentials" \
+  --data-urlencode "client_id=${CREDPROXY_CLIENT_ID}" \
+  --data-urlencode "client_secret=${CREDPROXY_CLIENT_SECRET}" \
+  "$CREDPROXY_KEYCLOAK_URL"
+```
+
+This is correct. The `CREDPROXY_KEYCLOAK_URL` should be the token endpoint:
+`http://<host>/realms/<realm>/protocol/openid-connect/token`.
+
+
+# Service Account Setup
+
+## Creating a Client with Service Account
+
+Via the Admin REST API:
+
+```bash
+# 1. Get admin token
+ADMIN_TOKEN=$(curl -s -X POST \
+  "http://localhost:8080/realms/master/protocol/openid-connect/token" \
+  -d "grant_type=client_credentials" \
+  -d "client_id=admin-cli" \
+  -d "client_secret=<admin-secret>" | jq -r '.access_token')
+
+# 2. Create client with service account enabled
+curl -s -X POST \
+  "http://localhost:8080/admin/realms/openclaw/clients" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "clientId": "agent-worker-1",
+    "enabled": true,
+    "protocol": "openid-connect",
+    "publicClient": false,
+    "serviceAccountsEnabled": true,
+    "standardFlowEnabled": false,
+    "directAccessGrantsEnabled": false,
+    "clientAuthenticatorType": "client-secret",
+    "secret": "<generated-or-specified>"
+  }'
+```
+
+From `ClientsResource.java` lines 206-254, the `createClient` endpoint checks
+`rep.isServiceAccountsEnabled()` and calls `enableServiceAccount()` which
+creates the `service-account-<clientId>` user.
+
+## Assigning Roles to a Service Account
+
+```bash
+# 3. Get the service account user ID
+SA_USER_ID=$(curl -s \
+  "http://localhost:8080/admin/realms/openclaw/clients/<client-uuid>/service-account-user" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.id')
+
+# 4. Get realm role by name
+ROLE=$(curl -s \
+  "http://localhost:8080/admin/realms/openclaw/roles/agent-read" \
+  -H "Authorization: Bearer $ADMIN_TOKEN")
+
+# 5. Assign realm role to service account
+curl -s -X POST \
+  "http://localhost:8080/admin/realms/openclaw/users/$SA_USER_ID/role-mappings/realm" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "[$ROLE]"
+```
+
+## Assigning Groups to a Service Account
+
+```bash
+# 6. Get group by path
+GROUP_ID=$(curl -s \
+  "http://localhost:8080/admin/realms/openclaw/groups?search=workers" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq -r '.[0].id')
+
+# 7. Add service account to group
+curl -s -X PUT \
+  "http://localhost:8080/admin/realms/openclaw/users/$SA_USER_ID/groups/$GROUP_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+## Declarative Approach: Realm Import
+
+Instead of REST API calls, Keycloak supports importing complete realm
+configurations from JSON files. The NixOS module (see Section 8) supports this
+via `services.keycloak.realmFiles`. A realm export JSON includes clients,
+roles, groups, service account users, and protocol mappers -- everything
+needed.
+
+This is the recommended approach for the credential-proxy NixOS module:
+generate a realm JSON at build time rather than scripting the Admin API.
+
+
+# JWKS Endpoint and OIDC Discovery
+
+## How coreos/go-oidc Discovers Keys
+
+The `gooidc.NewProvider(ctx, issuerURL)` call in `oidc.go` line 49 performs
+OIDC Discovery:
+
+1. Fetches `{issuerURL}/.well-known/openid-configuration`
+2. Extracts the `jwks_uri` field
+3. Caches the JWKS keys with automatic rotation
+
+From `OIDCWellKnownProvider.java` line 127-133, the `jwks_uri` is
+constructed as:
+
+```
+{backend-base}/realms/{realm}/protocol/openid-connect/certs
+```
+
+The JWKS endpoint (`OIDCLoginProtocolService.certs()`, lines 199-218)
+returns a `JSONWebKeySet` with all active realm signing keys. CORS is
+configured to allow all origins (`Cors.builder().allowAllOrigins().auth()`).
+
+## Key Rotation
+
+Keycloak uses `JWKSServerUtils.getRealmJwks(session, realm)` to gather all
+active keys. When realm keys are rotated, the JWKS endpoint immediately
+reflects the new keys. The `coreos/go-oidc` library caches JWKS but
+re-fetches when it encounters an unknown `kid` in a token header, providing
+transparent rotation support.
+
+## Signing Algorithms
+
+From `OIDCWellKnownProvider.getSupportedSigningAlgorithms()`, Keycloak
+reports all registered `SignatureProvider` implementations. The default is
+RS256, but ES256, PS256, and others are available. The `coreos/go-oidc`
+library handles all standard JWS algorithms.
+
+## Issuer Mismatch Warning
+
+The `OIDCWellKnownProvider` distinguishes between frontend and backend URIs
+(line 107-108). The issuer uses the **frontend** URI, while the token and
+JWKS endpoints use the **backend** URI. If Keycloak is behind a reverse proxy,
+the `issuer_url` in the credential-proxy config must match the public-facing
+URL that Keycloak reports as its issuer, not the internal URL.
+
+For VSOCK-bridged deployments where the guest accesses Keycloak via
+`localhost:<port>`, ensure Keycloak's `hostname` setting is configured
+to match what the guest sees, or use `hostname-backchannel-dynamic = true`.
+
+
+# Token Structure
+
+## Class Hierarchy (from source)
+
+```
+JsonWebToken           -- jti, exp, nbf, iat, iss, aud, sub, typ, azp, otherClaims
+  |
+  +-- IDToken          -- nonce, auth_time, sid, name, email, acr, ...
+        |
+        +-- AccessToken -- realm_access, resource_access, scope, cnf, authorization
+```
+
+## AccessToken Fields (from `AccessToken.java`)
+
+| JSON Claim         | Java Field        | Type                          | Description |
+|--------------------|-------------------|-------------------------------|-------------|
+| `jti`              | `id`              | `String`                      | Unique token ID |
+| `exp`              | `exp`             | `Long`                        | Expiration (epoch seconds) |
+| `iat`              | `iat`             | `Long`                        | Issued-at (epoch seconds) |
+| `iss`              | `issuer`          | `String`                      | Issuer URL (realm URL) |
+| `sub`              | `subject`         | `String`                      | Subject (user UUID) |
+| `aud`              | `audience`        | `String[]`                    | Audience(s) |
+| `azp`              | `issuedFor`       | `String`                      | Authorized party (client_id) |
+| `typ`              | `type`            | `String`                      | Token type (`Bearer`) |
+| `scope`            | `scope`           | `String`                      | Space-separated scopes |
+| `realm_access`     | `realmAccess`     | `Access{roles: Set<String>}`  | Realm role set |
+| `resource_access`  | `resourceAccess`  | `Map<String, Access>`         | Per-client role sets |
+| `sid`              | `sessionId`       | `String`                      | Session ID |
+| `preferred_username` | `preferredUsername` | `String`                  | Display username |
+| `cnf`              | `confirmation`    | `Confirmation`                | Certificate/DPoP binding |
+| `allowed-origins`  | `allowedOrigins`  | `Set<String>`                 | CORS origins |
+| `groups`           | (otherClaims)     | `List<String>`                | Group paths (via mapper) |
+
+## Example Decoded Token (client_credentials)
+
+```json
+{
+  "exp": 1739800000,
+  "iat": 1739799700,
+  "jti": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "iss": "http://localhost:8080/realms/openclaw",
+  "sub": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+  "typ": "Bearer",
+  "azp": "agent-worker-1",
+  "aud": "credential-proxy",
+  "scope": "profile email",
+  "realm_access": {
+    "roles": [
+      "agent-read",
+      "agent-write",
+      "default-roles-openclaw"
+    ]
+  },
+  "resource_access": {
+    "agent-worker-1": {
+      "roles": ["uma_protection"]
+    }
+  },
+  "groups": [
+    "/workers",
+    "/workers/team-alpha"
+  ],
+  "preferred_username": "service-account-agent-worker-1",
+  "clientId": "agent-worker-1",
+  "clientHost": "192.168.1.100",
+  "clientAddress": "192.168.1.100"
+}
+```
+
+## Important Notes on Claims
+
+### `realm_access.roles` (default mapper)
+
+Mapped by `UserRealmRoleMappingMapper` (provider ID: `oidc-usermodel-realm-role-mapper`).
+This is a **default** client scope mapper -- it is included in tokens by
+default without additional configuration. The claim path is `realm_access.roles`.
+
+The existing `extractRealmRoles()` in `oidc.go` correctly navigates this structure.
+
+### `resource_access` (default mapper)
+
+Mapped by `UserClientRoleMappingMapper` (provider ID: `oidc-usermodel-client-role-mapper`).
+Also a default mapper. The structure is `resource_access.<clientId>.roles`.
+
+The credential-proxy does **not** currently extract `resource_access` roles.
+This should be added if per-client role scoping is needed (e.g., different
+credentials for different API providers).
+
+### `groups` (requires explicit mapper)
+
+Mapped by `GroupMembershipMapper` (provider ID: `oidc-group-membership-mapper`).
+This is **NOT** a default mapper -- it must be explicitly added to a client
+scope. The `full.path` option (default `true`) controls whether the claim
+contains full paths like `/workers/team-alpha` or just the leaf name
+`team-alpha`.
+
+Action required: A "groups" protocol mapper must be added to the client's
+scope configuration for the `groups` claim to appear in tokens. This can be
+done via realm import JSON.
+
+### `aud` (audience)
+
+By default, for `client_credentials` tokens, the `aud` claim may only contain
+the client itself (`azp`). To add the credential-proxy as an audience, use
+either:
+
+- **AudienceProtocolMapper** (`oidc-audience-mapper`): Adds a specific client
+  or custom string to the `aud` array.
+- **AudienceResolveProtocolMapper** (`oidc-audience-resolve-mapper`): A default
+  mapper that automatically adds any client for which the token has
+  `resource_access` roles.
+
+For the credential-proxy, the recommended approach is to add an
+`AudienceProtocolMapper` with `included.custom.audience = "credential-proxy"`
+to the realm's default client scope.
+
+### `azp` (authorized party)
+
+Always set to the `client_id` of the requesting client. For
+`client_credentials`, this is the agent's client ID (e.g., `agent-worker-1`).
+
+### `preferred_username`
+
+For service accounts, this is `service-account-{clientId}`.
+
+### Service account note claims
+
+The `ClientCredentialsGrantType` adds session notes (lines 125-128):
+- `clientId` -- the client ID
+- `clientHost` -- the connecting host
+- `clientAddress` -- the connecting IP
+
+These appear in the token via default service account protocol mappers.
+
+
+# Token Exchange (RFC 8693)
+
+## Availability
+
+Token exchange requires the `TOKEN_EXCHANGE` or `TOKEN_EXCHANGE_STANDARD_V2`
+feature flag (from `TokenExchangeGrantTypeFactory.isSupported()`, line 51-53).
+This is a preview/experimental feature in Keycloak.
+
+## Standard Token Exchange (V2)
+
+The `StandardTokenExchangeProvider` (introduced 2025) implements RFC 8693
+compliant token exchange. It supports:
+
+- `subject_token_type = urn:ietf:params:oauth:token-type:access_token`
+- `requested_token_type` can be access token, ID token, or refresh token
+- Audience restriction via `audience` parameter
+- Scope narrowing via `scope` parameter
+
+It does **not** support:
+- Subject impersonation (`requested_subject` parameter)
+- External token exchange (`requested_issuer`, `subject_issuer`)
+- SAML2 target tokens
+
+## Relevance to credential-proxy
+
+Token exchange is **not needed** for the current architecture. The
+`client_credentials` flow is sufficient: each agent client authenticates
+directly and gets a token with its roles. Token exchange would be relevant if:
+
+- A control plane needs to issue narrowed tokens on behalf of agents
+- Cross-realm delegation is needed
+- Token audience needs to be changed post-issuance
+
+For now, skip token exchange. If needed later, it can be added by enabling
+the feature flag and configuring the client with
+`standardTokenExchangeEnabled = true`.
+
+
+# Admin REST API
+
+## Authentication
+
+All Admin API calls require a bearer token with admin privileges. The
+token can be obtained via `client_credentials` using the `admin-cli` client
+in the `master` realm, or any client with the appropriate admin roles.
+
+```
+Base: {scheme}://{host}/admin/realms/{realm-name}
+```
+
+## Key Endpoints (from source)
+
+| Operation | Method | Path | Source Class |
+|-----------|--------|------|-------------|
+| List realms | GET | `/admin/realms` | `RealmsAdminResource` |
+| Create realm | POST | `/admin/realms` | `RealmsAdminResource` |
+| Get realm | GET | `/admin/realms/{realm}` | `RealmAdminResource` |
+| List clients | GET | `/admin/realms/{realm}/clients` | `ClientsResource` |
+| Create client | POST | `/admin/realms/{realm}/clients` | `ClientsResource` |
+| Get client | GET | `/admin/realms/{realm}/clients/{id}` | `ClientResource` |
+| List realm roles | GET | `/admin/realms/{realm}/roles` | `RoleContainerResource` |
+| Create realm role | POST | `/admin/realms/{realm}/roles` | `RoleContainerResource` |
+| List groups | GET | `/admin/realms/{realm}/groups` | `GroupsResource` |
+| Create group | POST | `/admin/realms/{realm}/groups` | `GroupsResource` |
+| Get service account user | GET | `/admin/realms/{realm}/clients/{id}/service-account-user` | `ClientResource` |
+| Assign realm roles | POST | `/admin/realms/{realm}/users/{userId}/role-mappings/realm` | `RoleMapperResource` |
+| Add user to group | PUT | `/admin/realms/{realm}/users/{userId}/groups/{groupId}` | `UserResource` |
+
+## Realm Import (Preferred)
+
+Rather than scripting individual API calls, use Keycloak's realm import
+feature. Create a JSON file containing the full realm configuration:
+
+```json
+{
+  "realm": "openclaw",
+  "enabled": true,
+  "sslRequired": "none",
+  "roles": {
+    "realm": [
+      { "name": "agent-read", "description": "Can read credentials" },
+      { "name": "agent-write", "description": "Can request credential injection" }
+    ]
+  },
+  "groups": [
+    {
+      "name": "workers",
+      "subGroups": [
+        { "name": "team-alpha" }
+      ]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "agent-worker-1",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "REPLACE_AT_DEPLOY_TIME",
+      "defaultClientScopes": [
+        "roles", "profile", "email", "groups"
+      ],
+      "protocolMappers": [
+        {
+          "name": "audience-credproxy",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "config": {
+            "included.custom.audience": "credential-proxy",
+            "access.token.claim": "true",
+            "id.token.claim": "false"
+          }
+        }
+      ]
+    }
+  ],
+  "clientScopes": [
+    {
+      "name": "groups",
+      "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "full.path": "true",
+            "access.token.claim": "true",
+            "claim.name": "groups",
+            "id.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "service-account-agent-worker-1",
+      "enabled": true,
+      "serviceAccountClientId": "agent-worker-1",
+      "realmRoles": ["agent-read", "agent-write"],
+      "groups": ["/workers/team-alpha"]
+    }
+  ]
+}
+```
+
+
+# NixOS Integration
+
+## Existing NixOS Keycloak Module
+
+The `services.keycloak` module in nixpkgs (version 26.5.2) provides:
+
+```nix
+services.keycloak = {
+  enable = true;
+  database = {
+    type = "postgresql";           # or "mysql", "mariadb"
+    createLocally = true;          # auto-creates DB + user
+    passwordFile = "/run/secrets/keycloak-db-password";
+  };
+  settings = {
+    hostname = "keycloak.example.com";
+    http-port = 8080;
+    http-host = "127.0.0.1";       # bind address
+    http-relative-path = "/";      # or "/auth" for legacy compat
+    hostname-strict = false;       # disable strict hostname check (for dev)
+    hostname-backchannel-dynamic = true;
+  };
+  initialAdminPassword = "changeme";  # bootstrap admin (change immediately)
+  realmFiles = [
+    ./openclaw-realm.json           # declarative realm import
+  ];
+};
+```
+
+### Key Features
+
+- **Realm import**: `realmFiles` accepts a list of JSON files. On first
+  startup, Keycloak imports them. If the realm already exists, import is
+  skipped.
+- **PostgreSQL auto-setup**: `database.createLocally = true` creates the
+  database, user, and handles schema migrations.
+- **systemd integration**: Uses `DynamicUser`, capability bounding, and
+  systemd-notify for readiness.
+- **Secret management**: Settings with `{ _secret = "/path/to/file"; }` are
+  replaced at service start from credential files, keeping secrets out of
+  the Nix store.
+- **Plugin support**: `plugins` option accepts plugin JARs.
+
+### Limitations
+
+- Realm import is one-shot (skipped if realm exists). Updates to the realm
+  JSON require either deleting the realm or using the Admin API.
+- No built-in option for client secret injection at runtime (secrets in realm
+  JSON would be in the Nix store). Use a wrapper script or post-start hook
+  to rotate secrets via Admin API.
+
+## Recommended Architecture
+
+```
+                 NixOS Host
+  +-------------------------------------------+
+  |  services.keycloak (port 8080)            |
+  |    realm: "openclaw"                       |
+  |    client: "agent-worker-1" (svc acct)    |
+  |                                            |
+  |  credential-proxy (VSOCK listener)         |
+  |    oidc.issuer_url: http://127.0.0.1:8080 |
+  |                     /realms/openclaw       |
+  |    oidc.audience: "credential-proxy"       |
+  +-------------------------------------------+
+           |  VSOCK
+  +-------------------------------------------+
+  |  NixOS Guest VM                            |
+  |  socat VSOCK bridge -> localhost:18790     |
+  |  credproxy-auth.sh -> token endpoint      |
+  |  Agent uses Proxy-Authorization: <JWT>    |
+  +-------------------------------------------+
+```
+
+The guest VM's `credproxy-auth.sh` should point its `CREDPROXY_KEYCLOAK_URL`
+to the host's token endpoint, accessed either:
+
+- Via the VSOCK bridge (if Keycloak is behind the same proxy)
+- Via a separate TCP port forwarded to the guest
+- Directly if the guest has network access to the host
+
+The cleanest approach is a second socat bridge or a direct vsock-to-TCP
+forward for the Keycloak token endpoint, so the guest can obtain tokens
+without routing through the credential-proxy itself (avoiding a circular
+dependency).
+
+
+# Summary of Findings
+
+| Area | Status | Notes |
+|------|--------|-------|
+| Realm isolation | Ready | Each realm = independent signing keys, users, roles |
+| `client_credentials` flow | Ready | `credproxy-auth.sh` correctly implements this |
+| Service account roles | Ready | Roles on `service-account-<clientId>` user |
+| `realm_access.roles` extraction | Ready | `extractRealmRoles()` in `oidc.go` is correct |
+| `resource_access` extraction | Gap | Not currently extracted; add if per-client roles needed |
+| `groups` claim | Requires config | GroupMembershipMapper must be explicitly added to client scope |
+| `aud` verification | Requires config | AudienceProtocolMapper needed to add "credential-proxy" to `aud` |
+| JWKS / OIDC discovery | Ready | `coreos/go-oidc` handles discovery and key rotation |
+| Token exchange | Not needed | `client_credentials` is sufficient for current architecture |
+| NixOS module | Available | `services.keycloak` with `realmFiles` for declarative setup |
+| Admin REST API | Documented | Available for runtime provisioning; prefer realm import |
+
+
+# Recommendations for credential-proxy
+
+1. **Add `resource_access` extraction**: Extend `AgentIdentity` to include
+   client-specific roles from `resource_access.<clientId>.roles`. This
+   enables per-API-provider role scoping in OPA policies.
+
+2. **Configure audience correctly**: Add an `oidc-audience-mapper` to the
+   client scope that includes `"credential-proxy"` in the `aud` claim.
+   Without this, the `coreos/go-oidc` verifier will reject tokens because
+   the `aud` will not match `cfg.Audience`.
+
+3. **Add groups mapper to realm**: The `groups` claim requires an explicit
+   `oidc-group-membership-mapper`. Include this in the realm import JSON
+   within a `"groups"` client scope.
+
+4. **Use realm import JSON**: Generate the realm configuration declaratively
+   in the NixOS module using `services.keycloak.realmFiles` rather than
+   scripting the Admin REST API. This is idempotent and fits the NixOS model.
+
+5. **Handle client secret rotation**: Since realm import JSON is in the Nix
+   store, do not embed production secrets there. Use a systemd
+   `ExecStartPost` hook to rotate the client secret via Admin API after
+   Keycloak starts, or use `LoadCredential` to inject it.
+
+6. **Consider `azp` in OPA policies**: The `azp` claim always contains the
+   requesting client's ID. This is useful for OPA policies that need to
+   distinguish between different agent clients within the same realm.
+
+7. **Token lifetime**: For short-lived agent operations, set the access token
+   TTL low (e.g., 60-300 seconds). The `credproxy-auth.sh` script already
+   handles re-authentication since it is called before each request.
+
+8. **Skip token exchange**: The current architecture does not require RFC 8693
+   token exchange. If cross-realm or delegation scenarios arise later, it can
+   be enabled via Keycloak feature flags.

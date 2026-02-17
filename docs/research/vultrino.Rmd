@@ -1,0 +1,672 @@
+---
+title: "Vultrino - Alias-Based Credential Reference Pattern Analysis"
+date: "2026-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+## Executive Summary
+
+Vultrino (<https://github.com/zachyking/vultrino>) is a Rust-based credential proxy
+for AI agents, enabling them to make authenticated API requests without ever seeing
+the underlying credentials. This report examines its alias-based credential
+reference patterns, MCP server integration, WASM plugin architecture, configuration
+model, and security model -- and evaluates which patterns are worth adopting in our
+own Go-based credential-proxy.
+
+**Key finding:** Vultrino's human-readable alias system with glob-pattern scoping is
+a meaningful improvement over our current `agent-vault-<uuid>` placeholder approach
+in terms of readability, auditability, and access control flexibility.
+
+**Repository vitals:**
+
+| Metric                   | Value                             |
+|:-------------------------|:----------------------------------|
+| Language                 | Rust (Tokio async runtime)        |
+| Lines of code            | ~14,000 across 36 source files    |
+| Git commits              | 1 (initial, 2026-01-29)           |
+| GitHub stars             | ~6                                |
+| License                  | MIT                               |
+| Credential types         | 8 built-in + custom via plugins   |
+| Plugin runtime           | Wasmtime 29 (WASI)               |
+
+---
+
+## Alias System
+
+### How Vultrino Implements Aliases
+
+Credentials are stored with both an internal UUID (`id`) and a human-readable
+alias (e.g., `github-api`, `stripe-test`). The alias is the primary reference
+used in CLI commands, MCP tool calls, configuration policies, and role scoping.
+
+The `CredentialResolver` in `/src/router/resolver.rs` performs a two-step lookup:
+alias first, then UUID fallback:
+
+```rust
+/// Resolve a credential by alias or ID
+pub async fn resolve(&self, alias_or_id: &str) -> Result<Credential, VultrinoError> {
+    // Try by alias first
+    if let Some(cred) = self.storage.get_by_alias(alias_or_id).await? {
+        return Ok(cred);
+    }
+    // Try by ID
+    if let Some(cred) = self.storage.get(alias_or_id).await? {
+        return Ok(cred);
+    }
+    Err(VultrinoError::CredentialNotFound(alias_or_id.to_string()))
+}
+```
+
+The `StorageBackend` trait exposes `get_by_alias()` as a first-class operation alongside
+`get()` (by UUID), ensuring alias lookup is as efficient as direct ID lookup.
+
+### URL Pattern Auto-Detection
+
+The `UrlMatcher` in `/src/router/matcher.rs` allows mapping URL glob patterns to
+credential aliases. For example, `https://api.github.com/*` can be mapped to the
+`github-api` credential. First-match wins, with pattern priority determined by
+insertion order:
+
+```rust
+pub struct UrlMatcher {
+    patterns: Vec<(Pattern, String)>,
+}
+
+pub fn match_url(&self, url: &str) -> Option<&str> {
+    for (pattern, alias) in &self.patterns {
+        if pattern.matches(url) {
+            return Some(alias);
+        }
+    }
+    None
+}
+```
+
+### Comparison With Our Placeholder UUID Approach
+
+Our current credential-proxy uses opaque placeholder tokens:
+
+```go
+// regex: agent-vault-[a-f0-9]{8}-[a-f0-9]{4}-...-[a-f0-9]{12}
+var placeholderPattern = regexp.MustCompile(
+    `agent-vault-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`,
+)
+```
+
+Configuration maps placeholders to vault paths statically:
+
+```yaml
+credentials:
+  - placeholder: agent-vault-00000000-0000-0000-0000-000000000001
+    vault_path: secret/data/openclaw/credentials/anthropic
+    bound_domain: api.anthropic.com
+    type: api_key
+```
+
+**Advantages of the alias approach over placeholder UUIDs:**
+
+1. **Readability** -- `anthropic-api` vs `agent-vault-00000000-...-000000000001`.
+2. **Auditability** -- Log entries and audit trails show human-meaningful names.
+3. **Flexibility** -- Vault path changes do not require updating every reference.
+4. **Scoping** -- Role-based glob patterns operate naturally on aliases (e.g., `github-*`).
+5. **URL auto-detection** -- Can infer credentials from the target URL pattern.
+
+---
+
+## MCP Server Integration
+
+### Architecture
+
+Vultrino's MCP server (`/src/mcp/server.rs`) is a JSON-RPC 2.0 server running over
+stdio. It wraps a `VultrinoServer` and an `AuthManager`, requiring an API key on
+every tool call:
+
+```rust
+pub struct McpServer {
+    vultrino: Arc<RwLock<VultrinoServer>>,
+    initialized: bool,
+    auth_manager: Arc<RwLock<AuthManager>>,
+}
+```
+
+### Exposed MCP Tools
+
+| Tool                | Description                                     | Permission Required |
+|:--------------------|:------------------------------------------------|:--------------------|
+| `list_credentials`  | List available credentials (metadata only)      | `read`              |
+| `get_credential_info` | Get credential metadata (never secret values) | `read`              |
+| `http_request`      | Make authenticated HTTP request                 | `execute`           |
+| Plugin tools        | e.g., `pgp_sign`, `pgp_verify`                 | `execute`           |
+
+### Per-Request Authentication
+
+Every MCP tool invocation includes the API key in the arguments, enabling multiple
+agents with different roles to share a single MCP server:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "http_request",
+    "arguments": {
+      "api_key": "vk_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6",
+      "credential": "github-api",
+      "method": "GET",
+      "url": "https://api.github.com/user"
+    }
+  }
+}
+```
+
+The server validates the API key, checks the role's permissions and credential scopes,
+and only then forwards the request to the `VultrinoServer` for execution.
+
+### MCP Method Routing
+
+```rust
+match request.method.as_str() {
+    "initialize"     => self.handle_initialize(&request).await,
+    "initialized"    => { /* notification, no response */ },
+    "tools/list"     => self.handle_tools_list(&request).await,
+    "tools/call"     => self.handle_tools_call(&request).await,
+    "resources/list" => self.handle_resources_list(&request).await,
+    "ping"           => Ok(json!({})),
+    method           => Err((METHOD_NOT_FOUND, format!("Method not found: {}", method))),
+}
+```
+
+---
+
+## WASM Plugin Architecture
+
+### Plugin Trait
+
+The core plugin interface (`/src/plugins/mod.rs`) is trait-based with async execution:
+
+```rust
+#[async_trait]
+pub trait Plugin: Send + Sync {
+    fn name(&self) -> &str;
+    fn supported_credential_types(&self) -> Vec<CredentialType>;
+    fn supported_actions(&self) -> Vec<&str>;
+
+    async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError>;
+    fn validate_params(&self, action: &str, params: &serde_json::Value) -> Result<(), PluginError>;
+
+    // Optional extension points with default implementations:
+    fn url_patterns(&self) -> Vec<&str> { vec![] }
+    fn manifest(&self) -> Option<&PluginManifest> { None }
+    fn credential_type_definitions(&self) -> Vec<CredentialTypeDefinition> { vec![] }
+    fn mcp_tool_definitions(&self) -> Vec<McpToolDefinition> { vec![] }
+}
+```
+
+### Built-In Plugins
+
+| Plugin          | Credential Types            | Use Case                       |
+|:----------------|:----------------------------|:-------------------------------|
+| `HttpPlugin`    | `api_key`, `oauth2`, `basic_auth` | Standard HTTP authentication |
+| `HmacPlugin`    | `hmac_api_key`              | Binance, AsterDex-style APIs   |
+| `EcdsaPlugin`   | `ecdsa_key`                 | Ethereum, Hyperliquid signing  |
+
+### WASM Plugin ABI
+
+External plugins are compiled to `wasm32-wasip1` and loaded via Wasmtime. The ABI
+is minimal, based on exported C-ABI functions:
+
+```rust
+// plugins/pgp-signing/src/lib.rs
+
+const ABI_VERSION: u32 = 1;
+
+#[no_mangle]
+pub extern "C" fn vultrino_plugin_version() -> u32 {
+    ABI_VERSION
+}
+
+#[no_mangle]
+pub extern "C" fn vultrino_alloc(size: u32) -> *mut u8 {
+    let layout = Layout::from_size_align(size as usize, 1).unwrap();
+    unsafe { alloc(layout) }
+}
+
+#[no_mangle]
+pub extern "C" fn vultrino_free(ptr: *mut u8, len: u32) {
+    // ...
+}
+
+#[no_mangle]
+pub extern "C" fn vultrino_execute(request_ptr: *const u8, request_len: u32) -> i32 {
+    // Host passes JSON request, plugin returns result code
+}
+```
+
+### Plugin Manifest (TOML)
+
+Each plugin declares its capabilities in `plugin.toml`:
+
+```toml
+[plugin]
+name = "pgp-signing"
+version = "1.0.0"
+description = "PGP/GPG signing and verification"
+format = "wasm"
+wasm_module = "plugin.wasm"
+
+[[credential_types]]
+name = "pgp_key"
+display_name = "PGP Private Key"
+
+[[credential_types.fields]]
+name = "private_key"
+label = "Private Key (PEM/ASCII-armored)"
+type = "password"
+required = true
+secret = true
+
+[[actions]]
+name = "sign_cleartext"
+description = "Create cleartext signed message"
+
+[[mcp_tools]]
+name = "pgp_sign"
+description = "Sign data with PGP key"
+action = "sign"
+```
+
+The manifest is validated at install time: name format is checked, WASM plugins must
+declare `wasm_module`, and all credential type / action definitions are validated
+for required fields.
+
+---
+
+## Configuration Model
+
+### Two-Phase Parsing
+
+Vultrino separates raw TOML parsing from validated configuration construction
+(`/src/config/types.rs`):
+
+```rust
+// Phase 1: Permissive deserialization (all fields optional)
+#[derive(Debug, Deserialize)]
+pub struct RawConfig {
+    pub server: Option<RawServerConfig>,
+    pub storage: Option<RawStorageConfig>,
+    pub logging: Option<RawLoggingConfig>,
+    pub mcp: Option<RawMcpConfig>,
+    #[serde(default)]
+    pub policies: Vec<RawPolicy>,
+}
+
+// Phase 2: Strongly-typed, fully validated
+pub struct Config {
+    pub server: ServerConfig,     // defaults applied
+    pub storage: StorageConfig,   // backend validated
+    pub logging: LoggingConfig,   // level parsed
+    pub mcp: McpConfig,           // transport resolved
+    pub policies: Vec<Policy>,    // rules compiled
+}
+```
+
+### Policy Engine Configuration
+
+Policies bind to credential aliases using glob patterns and compose conditions
+with boolean combinators:
+
+```toml
+[[policies]]
+name = "github-readonly"
+credential_pattern = "github-*"
+default_action = "deny"
+
+[[policies.rules]]
+condition = { url_match = "https://api.github.com/*" }
+action = "allow"
+
+[[policies.rules]]
+condition = { method_match = ["POST", "PUT", "DELETE"] }
+action = "deny"
+```
+
+Conditions support `url_match`, `method_match`, `rate_limit`, and boolean `and`/`or`
+composition, all represented as a `#[serde(untagged)]` enum.
+
+### Our Configuration
+
+Our credential-proxy uses a single YAML config with flat credential definitions.
+The main structural differences:
+
+| Aspect                | Vultrino (TOML)                  | credential-proxy (YAML)          |
+|:----------------------|:---------------------------------|:---------------------------------|
+| Parsing strategy      | Two-phase (raw then validated)   | Single-pass with `yaml.Unmarshal`|
+| Credential reference  | Human-readable aliases           | Placeholder UUIDs                |
+| Policy engine         | Composable rules with conditions | OPA Rego policies                |
+| Storage backend       | Configurable (file, vault)       | OpenBao only                     |
+| Server mode           | Local vs Server (auth toggle)    | Always authenticated (OIDC)      |
+
+---
+
+## Security Model (Credential Scoping)
+
+### Role-Based Access Control
+
+Vultrino defines a five-permission RBAC model (`/src/auth/types.rs`):
+
+```rust
+pub enum Permission {
+    Read,     // List credentials (metadata only, never secrets)
+    Write,    // Create new credentials
+    Update,   // Modify existing credentials
+    Delete,   // Remove credentials
+    Execute,  // Use credentials to make authenticated requests
+}
+```
+
+### Credential Scoping via Glob Patterns
+
+Roles include `credential_scopes` -- a list of glob patterns that determine which
+credential aliases the role can access:
+
+```rust
+pub struct Role {
+    pub id: String,
+    pub name: String,
+    pub permissions: HashSet<Permission>,
+    pub credential_scopes: Vec<String>,  // e.g., ["github-*", "stripe-test"]
+    pub created_at: DateTime<Utc>,
+}
+
+pub fn can_access_credential(&self, alias: &str) -> bool {
+    if self.credential_scopes.is_empty() {
+        return true;  // empty scopes = access all
+    }
+    for scope in &self.credential_scopes {
+        if let Ok(pattern) = glob::Pattern::new(scope) {
+            if pattern.matches(alias) {
+                return true;
+            }
+        }
+    }
+    false
+}
+```
+
+### Predefined Roles
+
+| Role          | Permissions                              | Intended Use       |
+|:--------------|:-----------------------------------------|:-------------------|
+| `admin`       | read, write, update, delete, execute     | Full admin access  |
+| `executor`    | read, execute                            | AI agents          |
+| `read-only`   | read                                     | Monitoring only    |
+
+### API Key Design
+
+Keys use a `vk_` prefix followed by 32 random characters. Only the SHA-256 hash is
+stored; the plaintext key is shown once at creation. Keys bind to a role and support
+optional expiration dates.
+
+```rust
+const KEY_PREFIX: &str = "vk_";
+const KEY_RANDOM_LENGTH: usize = 32;
+// Stored hash: sha256(key), not the key itself
+```
+
+### Threat Model Coverage
+
+| Threat                                  | Mitigation                                          |
+|:----------------------------------------|:----------------------------------------------------|
+| Credential exfiltration via agent       | Agents never see credentials; alias-only references |
+| Unauthorized credential access          | API key + role + credential scope validation        |
+| SSRF via OAuth2 token URL               | HTTPS required, private IP detection on resolution  |
+| Token leakage in logs                   | AES-256-GCM encrypted storage, `SecretString` type |
+| Redirect-based credential exfiltration  | (Not applicable -- proxy mode, not pass-through)    |
+
+### Comparison With Our Security Model
+
+Our proxy uses OIDC JWTs with OPA policies and domain-binding per credential.
+Vultrino uses API keys with role/scope-based access control. Both prevent credential
+exposure to agents. Our domain-binding (`bound_domain` per credential) provides a
+hard boundary that Vultrino achieves through URL-match policies instead.
+
+---
+
+## Credential Type Coverage
+
+### Vultrino's Credential Types
+
+```rust
+pub enum CredentialType {
+    ApiKey,           // Authorization: Bearer <key>
+    OAuth2,           // Client credentials + refresh token flows
+    BasicAuth,        // Authorization: Basic <base64>
+    PrivateKey,       // PEM keys for signing operations
+    Certificate,      // mTLS certificates
+    HmacApiKey,       // HMAC-signed requests (Binance, AsterDex)
+    EcdsaKey,         // ECDSA signing (Ethereum, Hyperliquid)
+    Custom(String),   // Plugin-defined types
+}
+```
+
+### Our Credential Types
+
+```go
+const (
+    CredentialTypeAPIKey    CredentialType = "api_key"
+    CredentialTypeBearer    CredentialType = "bearer"
+    CredentialTypeBasicAuth CredentialType = "basic_auth"
+    CredentialTypeHeader    CredentialType = "header"
+)
+```
+
+### Gap Analysis
+
+| Type              | Vultrino | credential-proxy | Notes                          |
+|:------------------|:---------|:-----------------|:-------------------------------|
+| API Key / Bearer  | Yes      | Yes              | Equivalent                     |
+| Basic Auth        | Yes      | Yes              | Equivalent                     |
+| Custom Header     | Yes      | Yes              | Both support arbitrary headers |
+| OAuth2            | Yes      | No               | Auto token refresh missing     |
+| Private Key       | Yes      | No               | Signing operations             |
+| Certificate/mTLS  | Yes      | No               | Client certificate auth        |
+| HMAC API Key      | Yes      | No               | Exchange-style signed requests |
+| ECDSA Key         | Yes      | No               | Blockchain signing             |
+| Custom (plugin)   | Yes      | No               | Extensible via WASM            |
+
+---
+
+## Project Maturity Assessment
+
+### Strengths
+
+1. **Clean architecture** -- Trait-based plugin system, separate storage backend abstraction,
+   two-phase config parsing, and clear module boundaries.
+2. **Comprehensive credential types** -- Eight built-in types plus plugin extensibility covers
+   most authentication patterns.
+3. **Security-first design** -- SSRF checks on OAuth token URLs, constant-time comparison
+   (`subtle` crate), AES-256-GCM with Argon2id key derivation, `SecretString` / `zeroize`.
+4. **MCP integration** -- Native JSON-RPC 2.0 MCP server with per-call API key auth.
+5. **Web UI** -- Askama-templated admin interface (Axum server).
+
+### Limitations
+
+1. **Single commit** -- The entire codebase was pushed in one commit (2026-01-29). No
+   iterative development history is visible, raising questions about real-world testing.
+2. **No integration tests** -- Only inline unit tests and one `auth_integration.rs` stub.
+   No end-to-end test harness.
+3. **No deployment artifacts** -- No Dockerfile, no Nix flake, no systemd unit. Purely
+   source-only distribution.
+4. **Single-node only** -- No distributed deployment, no clustering, no HA.
+5. **WASM plugin ABI undocumented** -- The ABI exists in code but lacks specification docs.
+6. **No performance benchmarks** -- No load testing or latency measurements.
+
+### Maturity Scores
+
+| Dimension               | Score | Notes                                 |
+|:------------------------|:------|:--------------------------------------|
+| Code quality            | 7/10  | Clean, idiomatic Rust                 |
+| Documentation           | 6/10  | Good README, guide stubs              |
+| Test coverage           | 5/10  | Unit tests present, integration gaps  |
+| Operational readiness   | 3/10  | Single commit, no deployment tooling  |
+| API stability           | 3/10  | Pre-release, no versioned API         |
+
+---
+
+## Summary: Patterns and Adoption Recommendations
+
+```{r patterns-table, echo=FALSE, eval=TRUE}
+patterns <- data.frame(
+  Pattern = c(
+    "Alias-based credential references",
+    "Glob-pattern credential scoping",
+    "WASM plugin architecture",
+    "API key design (prefixed, hashed)",
+    "Two-phase config validation",
+    "MCP server with per-call auth",
+    "URL auto-detection for credentials",
+    "OAuth2 with auto token refresh",
+    "Composable policy conditions",
+    "Temporal workflow orchestration"
+  ),
+  Vultrino = c(
+    "Human-readable aliases",
+    "Role credential_scopes with glob",
+    "Trait + Wasmtime WASI runtime",
+    "vk_ prefix, SHA-256 hash stored",
+    "RawConfig -> Config with defaults",
+    "JSON-RPC 2.0 over stdio",
+    "UrlMatcher glob patterns",
+    "Built-in HttpPlugin",
+    "url_match, method_match, rate_limit AND/OR",
+    "Not present"
+  ),
+  Our_Code = c(
+    "UUID placeholders (agent-vault-<uuid>)",
+    "OPA Rego policies",
+    "Not present",
+    "OIDC JWT tokens",
+    "Single-pass YAML parse",
+    "Not present",
+    "Domain binding (bound_domain)",
+    "Not present",
+    "OPA Rego policies",
+    "Temporal client + worker"
+  ),
+  Recommendation = c(
+    "ADOPT -- improves readability and auditability",
+    "ADOPT -- enables fine-grained per-role access control",
+    "CONSIDER -- useful for custom signing operations",
+    "ADOPT -- complement OIDC with scoped API keys",
+    "ADOPT -- separates parsing from validation",
+    "ADD -- enables agent credential discovery via MCP",
+    "CONSIDER -- alternative to static domain binding",
+    "ADD -- needed for OAuth2 API integrations",
+    "KEEP OPA -- more powerful than Vultrino's policy engine",
+    "KEEP -- Vultrino lacks this; it adds auditability"
+  ),
+  stringsAsFactors = FALSE
+)
+knitr::kable(patterns, col.names = c("Pattern", "Vultrino", "Our Code", "Recommendation"))
+```
+
+---
+
+## Key Takeaways for credential-proxy
+
+### Patterns to Adopt
+
+1. **Replace placeholder UUIDs with human-readable aliases.** This is the single
+   highest-value change. An alias like `anthropic-api` is self-documenting in
+   configs, logs, audit trails, and agent interactions. The underlying vault path
+   mapping stays the same; only the reference changes.
+
+2. **Add glob-pattern credential scoping to authorization.** Vultrino's
+   `credential_scopes: ["github-*"]` pattern is a concise way to restrict what
+   credentials a role/identity can access. This can complement (not replace) our
+   OPA policies.
+
+3. **Introduce prefixed API keys alongside OIDC.** A `cp_<random>` API key scheme
+   (analogous to Vultrino's `vk_` keys) enables lightweight programmatic access
+   with revocation and expiration, without requiring a full OIDC flow.
+
+4. **Separate config parsing from validation.** A two-phase approach (raw struct
+   with `Option` fields, then validated struct with defaults applied) catches
+   misconfiguration earlier and makes the valid-config contract explicit.
+
+### Patterns to Consider
+
+5. **MCP server integration for credential discovery.** Agents discovering
+   available credentials through `list_credentials` and using them via
+   `http_request` is a cleaner interface than embedding placeholder tokens
+   in system prompts.
+
+6. **URL auto-detection.** Instead of requiring the agent to know which
+   credential to use for which domain, the proxy could infer it from the
+   request URL. This reduces agent complexity but adds implicit coupling.
+
+7. **WASM plugin system for extensibility.** Useful if we need to support
+   custom signing operations (HMAC, ECDSA) without recompiling the proxy.
+   The Go ecosystem has WASM runtimes (wazero) that could serve this role.
+
+### Patterns to Keep
+
+8. **Temporal workflows for audit logging.** Vultrino has no equivalent
+   orchestration system. Our Temporal integration provides durable audit
+   trails and the ability to add human-in-the-loop approval flows.
+
+9. **OPA policy evaluation.** Vultrino's built-in policy engine (url_match,
+   method_match, rate_limit) is less powerful than OPA Rego. Keep OPA for
+   complex authorization logic.
+
+10. **VSOCK transport and domain binding.** Our VSOCK listener with
+    fail-closed domain allowlists provides a stronger network isolation
+    boundary than Vultrino's TCP-based approach.
+
+### What Not to Adopt
+
+- **Vultrino as a dependency or replacement.** It is a single-commit project with
+  no deployment history. Use it as a reference design only.
+- **Vultrino's built-in encrypted storage.** We already have OpenBao (Vault fork)
+  which is a production-grade secrets management system.
+- **Vultrino's web UI pattern.** Our proxy is headless by design, running inside
+  a microVM. A web UI would be a separate concern.
+
+---
+
+## Appendix: Source File Reference
+
+### Vultrino Key Files
+
+| File                                   | Contents                                  |
+|:---------------------------------------|:------------------------------------------|
+| `src/router/resolver.rs`              | Alias resolution (alias -> credential)    |
+| `src/router/matcher.rs`              | URL glob pattern matching                 |
+| `src/auth/types.rs`                   | Permission enum, Role, ApiKey structs     |
+| `src/auth/manager.rs`                | API key creation, validation, revocation  |
+| `src/plugins/mod.rs`                  | Plugin trait definition                   |
+| `src/plugins/types.rs`               | PluginManifest, credential/action defs    |
+| `src/plugins/wasm/runtime.rs`        | Wasmtime WASI plugin loader               |
+| `src/plugins/http.rs`                | HttpPlugin (API key, OAuth2, Basic Auth)  |
+| `src/mcp/server.rs`                  | MCP JSON-RPC 2.0 server                  |
+| `src/config/types.rs`                | Two-phase config (RawConfig -> Config)    |
+| `src/storage/mod.rs`                 | StorageBackend trait                      |
+| `src/lib.rs`                          | CredentialType enum, CredentialData       |
+
+### Our credential-proxy Key Files
+
+| File                                   | Contents                                  |
+|:---------------------------------------|:------------------------------------------|
+| `proxy/placeholder.go`               | UUID placeholder extraction/replacement   |
+| `proxy/gateway.go`                   | goproxy MITM Gateway struct               |
+| `proxy/handlers.go`                  | CONNECT, OnRequest, OnResponse handlers   |
+| `config/config.go`                   | YAML config, credential index             |
+| `authn/oidc.go`                      | OIDC JWT verification                     |
+| `authz/engine.go`                    | OPA policy evaluator                      |
+| `vault/client.go`                    | OpenBao KV v2 client                      |
+| `workflows/`                          | Temporal workflow definitions              |

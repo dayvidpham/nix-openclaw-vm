@@ -1,0 +1,695 @@
+---
+title: "Ory Oathkeeper - Pipeline and Mutator Architecture Analysis"
+date: "2026-02-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+## Executive Summary
+
+Ory Oathkeeper implements a sophisticated rule-driven access control pipeline with a carefully designed interface hierarchy. Our credential-proxy uses a simpler, more specialized MITM proxy approach that handles authentication, authorization, vault resolution, and credential injection. Oathkeeper is significantly over-engineered for our narrower use case, but contains valuable patterns for composability, error handling, and rule matching that we should selectively adopt.
+
+**Source codebases studied:**
+
+- Oathkeeper: `~/codebases/oathkeeper/` (pipeline, handlers, rules, matching)
+- Credential-proxy: `/home/minttea/codebases/dayvidpham/nix-openclaw-vm/credential-proxy/` (gateway, handlers, config)
+
+---
+
+## Pipeline Architecture
+
+### Oathkeeper Pipeline Flow
+
+Oathkeeper's core pipeline is orchestrated in `proxy/request_handler.go` (lines 160--323) via the `HandleRequest` method:
+
+```
+request --> InitializeAuthnSession -->
+  [for each authenticator] Authenticate -->
+  Authorize -->
+  [for each mutator] Mutate -->
+  return session
+```
+
+**Key files:**
+
+| File | Role |
+|------|------|
+| `proxy/request_handler.go:160-323` | Pipeline orchestration |
+| `proxy/proxy.go:112-150` | Rule matching and proxy rewrite |
+| `proxy/request_handler.go:325-349` | Session initialization with regex groups |
+
+The `RequestHandler` interface exposes three methods:
+
+```go
+// proxy/request_handler.go:38-42
+type RequestHandler interface {
+    HandleError(w http.ResponseWriter, r *http.Request, rl *rule.Rule, handleErr error)
+    HandleRequest(r *http.Request, rl *rule.Rule) (session *authn.AuthenticationSession, err error)
+    InitializeAuthnSession(r *http.Request, rl *rule.Rule) *authn.AuthenticationSession
+}
+```
+
+**Sequential execution with first-match fallback:** Authenticators (line 184) iterate until one succeeds, skipping non-responsible handlers. A single authorizer (line 246) must succeed or the request fails. Mutators (line 288) are all applied in sequence and must all succeed.
+
+**Stateful session object** (`authn.AuthenticationSession`) carries Subject, Extra claims, Headers, and MatchContext (regex capture groups) through the entire pipeline for mutation handlers to reference.
+
+### Credential-Proxy Pipeline Flow
+
+Our pipeline is in `proxy/handlers.go` (lines 69--189):
+
+```
+request --> resolveToken --> VerifyToken (OIDC) -->
+  Extract placeholders -->
+  LookupCredential -->
+  Evaluate (OPA) -->
+  FetchCredential (vault) -->
+  ReplaceInRequest -->
+  return request
+```
+
+This is a linear, fail-fast flow. Each stage either succeeds or returns an error response immediately. No fallback mechanisms exist, and all logic lives in the monolithic `handleRequest` function.
+
+### Comparison
+
+| Aspect | Oathkeeper | Credential-Proxy | Assessment |
+|--------|-----------|------------------|------------|
+| Composition | Interface-driven, pluggable handlers | Monolithic functions | Oathkeeper's approach better for testability |
+| Error Handling | Sophisticated "When" matching | Simple status codes | Oathkeeper more flexible |
+| Handler Chaining | Authenticators (fallback), single authz, mutators (all-succeed) | Linear stages | Oathkeeper allows iteration, useful for fallback authn |
+| State Threading | Session object enriched through stages | Context UserData | Oathkeeper cleaner for multi-stage dependencies |
+
+---
+
+## Mutator Patterns
+
+### Oathkeeper Mutator Interface
+
+Defined in `pipeline/mutate/mutator.go` (lines 36--40):
+
+```go
+type Mutator interface {
+    Mutate(r *http.Request, session *authn.AuthenticationSession, config json.RawMessage, _ pipeline.Rule) error
+    GetID() string
+    Validate(config json.RawMessage) error
+}
+```
+
+Key characteristics: per-rule JSON config parsed at validation time, access to the authentication session (subject, extra claims), direct HTTP request mutation, and rule object providing context (ID, regex capture groups via `ReplaceAllString`).
+
+### Header Mutator Implementation
+
+From `pipeline/mutate/mutator_header.go` (lines 42--70):
+
+```go
+func (a *MutatorHeader) Mutate(_ *http.Request, session *authn.AuthenticationSession,
+    config json.RawMessage, rl pipeline.Rule) error {
+    cfg, err := a.config(config)
+    if err != nil {
+        return err
+    }
+
+    for hdr, templateString := range cfg.Headers {
+        var tmpl *template.Template
+        templateId := fmt.Sprintf("%s:%s", rl.GetID(), hdr)
+        tmpl = a.t.Lookup(templateId)
+        if tmpl == nil {
+            tmpl, err = a.t.New(templateId).Parse(templateString)
+            if err != nil {
+                return errors.Wrapf(err, `error parsing headers template "%s" in rule "%s"`,
+                    templateString, rl.GetID())
+            }
+        }
+
+        headerValue := bytes.Buffer{}
+        err = tmpl.Execute(&headerValue, session)
+        if err != nil {
+            return errors.Wrapf(err, `error executing headers template "%s" in rule "%s"`,
+                templateString, rl.GetID())
+        }
+        session.SetHeader(hdr, headerValue.String())
+    }
+    return nil
+}
+```
+
+Note the **template caching by rule+header** pattern: templates are keyed by `ruleID:headerName` and reused across requests.
+
+### Cookie Mutator Implementation
+
+From `pipeline/mutate/mutator_cookie.go` (lines 44--97). Handles cookie merging: iterates configured cookies, applies Go templates with session context, and re-adds existing request cookies that do not overlap with rule-configured cookies.
+
+### Credential-Proxy Approach
+
+Our approach differs fundamentally: we replace placeholders with vault-fetched secrets, rather than generating values from session claims. Our replacement logic in `proxy/handlers.go` (line 158):
+
+```go
+if err := ReplaceInRequest(req, replacements); err != nil {
+    slog.Error("credential injection failed", "error", err,
+        "subject", identity.Subject, "domain", targetDomain)
+    return req, errorResponse(req, http.StatusInternalServerError,
+        "credential injection failed")
+}
+```
+
+**Design Assessment:** Oathkeeper's template-based value generation is more flexible than static replacement. However, our simpler approach is correct -- we fetch real secrets, not generate values from claims. If we expand to multiple credential injection strategies, we should consider a formal `CredentialHandler` interface with per-handler configuration validation.
+
+---
+
+## Rule Matching Engine
+
+### Matching Engine Interface
+
+Defined in `rule/matching_engine.go`:
+
+```go
+type MatchingEngine interface {
+    IsMatching(pattern, matchAgainst string) (bool, error)
+    FindStringSubmatch(pattern, matchAgainst string) ([]string, error)
+    ReplaceAllString(pattern, input, replacement string) (string, error)
+    Checksum() uint64
+}
+```
+
+### Two Strategies
+
+**Regexp** (`rule/engine_regexp.go`): Uses `regexp2` library with timeout protection. CRC64 checksum tracks pattern changes for lazy recompilation:
+
+```go
+type regexpMatchingEngine struct {
+    compiled *regexp2.Regexp
+    checksum uint64
+    table    *crc64.Table
+}
+
+func (re *regexpMatchingEngine) compile(pattern string) error {
+    if re.table == nil {
+        re.table = crc64.MakeTable(polynomial)
+    }
+    if checksum := crc64.Checksum([]byte(pattern), re.table); checksum != re.checksum {
+        compiled, err := compiler.CompileRegex(pattern, '<', '>')
+        if err != nil {
+            return err
+        }
+        re.compiled = compiled
+        re.checksum = checksum
+    }
+    return nil
+}
+```
+
+**Glob** (`rule/engine_glob.go`): Simpler, faster, no capture groups. Uses `gobwas/glob` library.
+
+### Lazy Initialization
+
+From `rule/rule.go` (lines 244--258):
+
+```go
+func ensureMatchingEngine(rule *Rule, strategy configuration.MatchingStrategy) error {
+    if rule.matchingEngine != nil {
+        return nil
+    }
+    switch strategy {
+    case configuration.Glob:
+        rule.matchingEngine = new(globMatchingEngine)
+        return nil
+    case "", configuration.Regexp:
+        rule.matchingEngine = new(regexpMatchingEngine)
+        return nil
+    }
+    return errors.Wrap(ErrUnknownMatchingStrategy, string(strategy))
+}
+```
+
+### Rule Matching Decision
+
+From `rule/rule.go` (lines 207--223):
+
+```go
+func (r *Rule) IsMatching(strategy configuration.MatchingStrategy,
+    method string, u *url.URL, protocol Protocol) (bool, error) {
+    if r.Match == nil {
+        return false, errors.New("no Match configured (was nil)")
+    }
+    if !stringInSlice(method, r.Match.GetMethods()) {
+        return false, nil
+    }
+    if err := ensureMatchingEngine(r, strategy); err != nil {
+        return false, err
+    }
+    if r.Match.Protocol() != protocol {
+        return false, nil
+    }
+    matchAgainst := fmt.Sprintf("%s://%s%s", u.Scheme, u.Host, u.Path)
+    return r.matchingEngine.IsMatching(r.Match.GetURL(), matchAgainst)
+}
+```
+
+### Credential-Proxy Domain Matching
+
+Our approach is a simple domain allowlist with `map[string]bool` lookup:
+
+```go
+// config/config.go:191-193
+func (c *Config) IsAllowedDomain(domain string) bool {
+    return c.domainIndex[strings.ToLower(domain)]
+}
+```
+
+**Assessment:** Oathkeeper's URL pattern matching (regex and glob), protocol detection, and capture groups are overkill for our current domain-only matching. However, the lazy engine initialization pattern and `MatchingEngine` interface abstraction would be valuable if we expand to path-based routing rules.
+
+---
+
+## Error Handling Pipeline
+
+### Oathkeeper Error Handler Interface
+
+From `pipeline/errors/error.go` (lines 17--21):
+
+```go
+type Handler interface {
+    GetID() string
+    Handle(w http.ResponseWriter, r *http.Request, config json.RawMessage,
+        _ pipeline.Rule, err error) error
+    Validate(config json.RawMessage) error
+}
+```
+
+### "When" Matching System
+
+From `pipeline/errors/when.go` (lines 19--44):
+
+```go
+type (
+    Whens []When
+    When  struct {
+        Error   []string     `json:"error"`
+        Request *WhenRequest `json:"request"`
+    }
+
+    WhenRequest struct {
+        RemoteIP *WhenRequestRemoteIP `json:"remote_ip"`
+        Header   *WhenRequestHeader   `json:"header"`
+    }
+
+    WhenRequestRemoteIP struct {
+        Match                     []string `json:"match"`
+        RespectForwardedForHeader bool     `json:"respect_forwarded_for_header"`
+    }
+
+    WhenRequestHeader struct {
+        ContentType []string `json:"content_type"`
+        Accept      []string `json:"accept"`
+    }
+)
+```
+
+### Error Handler Selection Algorithm
+
+From `proxy/request_handler.go` (lines 76--158):
+
+1. Iterate rule-configured error handlers
+2. For each handler, check `matchesWhen` (line 93)
+3. First match handles the error
+4. If no rule handlers match, fall back to specificity-ordered global handlers (line 112)
+5. If still no match, return generic 500 (line 141)
+
+### Credential-Proxy Error Handling
+
+Inline status codes with simple `errorResponse` helper:
+
+```go
+// proxy/handlers.go:247-250
+func errorResponse(req *http.Request, code int, msg string) *http.Response {
+    return goproxy.NewResponse(req, "text/plain", code, msg)
+}
+```
+
+**Assessment:** Oathkeeper's conditional error handling (IP-based, header-based) and pluggable error response formats are unnecessary for our proxy. Simple HTTP status codes are sufficient. However, our existing sentinel error pattern (`ErrTokenExpired`, `ErrInvalidIssuer`, `ErrInvalidAudience` in `authn/oidc.go`) is already a good approach for programmatic error classification.
+
+---
+
+## Handler Registry
+
+### Oathkeeper Master Registry
+
+From `driver/registry.go` (lines 26--58):
+
+```go
+type Registry interface {
+    Init()
+    WithConfig(c configuration.Provider) Registry
+    WithLogger(l *logrusx.Logger) Registry
+    // ...
+    ProxyRequestHandler() proxy.RequestHandler
+    Proxy() *proxy.Proxy
+
+    authn.Registry   // AvailablePipelineAuthenticators(), PipelineAuthenticator(id)
+    authz.Registry   // AvailablePipelineAuthorizers(), PipelineAuthorizer(id)
+    mutate.Registry  // AvailablePipelineMutators(), PipelineMutator(id)
+    errors.Registry  // AvailablePipelineErrorHandlers(), PipelineErrorHandler(id)
+    rule.Registry    // RuleRepository(), RuleMatcher()
+    // ...
+}
+```
+
+Sub-registries follow a consistent two-method pattern:
+
+```go
+// pipeline/authn/registry.go
+type Registry interface {
+    AvailablePipelineAuthenticators() []string
+    PipelineAuthenticator(string) (Authenticator, error)
+}
+
+// pipeline/authz/registry.go
+type Registry interface {
+    AvailablePipelineAuthorizers() []string
+    PipelineAuthorizer(string) (Authorizer, error)
+}
+
+// pipeline/mutate/registry.go
+type Registry interface {
+    AvailablePipelineMutators() []string
+    PipelineMutator(string) (Mutator, error)
+}
+```
+
+### Implementation via RegistryMemory
+
+From `driver/registry_memory.go` (lines 62--66):
+
+```go
+authenticators map[string]authn.Authenticator  // ID -> instance
+authorizers    map[string]authz.Authorizer
+mutators       map[string]mutate.Mutator
+errors         map[string]pe.Handler
+```
+
+All handlers are compile-time registered at `Init()`, no dynamic plugin loading.
+
+### Credential-Proxy Composition
+
+From `proxy/gateway.go` (lines 21--33):
+
+```go
+type Gateway struct {
+    cfg      *config.Config
+    authn    authn.Verifier
+    authz    authz.Evaluator
+    vault    vault.SecretStore
+    proxy    *goproxy.ProxyHttpServer
+    temporal temporalclient.Client
+    connTokens sync.Map
+}
+```
+
+Direct field composition, single authenticator (OIDC), single authorizer (OPA). No handler ID-based lookup.
+
+**Assessment:** Oathkeeper's registry enables flexible per-rule handler substitution and runtime feature flags. For our single-path architecture (OIDC to OPA to Vault), direct DI composition is simpler and correct. A registry would only become valuable if we add alternative authenticators or authorizers.
+
+---
+
+## Configuration Model
+
+### Oathkeeper Rule Structure
+
+From `rule/rule.go` (lines 87--130):
+
+```go
+type Rule struct {
+    ID             string         `json:"id"`
+    Version        string         `json:"version"`
+    Description    string         `json:"description"`
+    Match          URLProvider    `json:"match"`
+    Authenticators []Handler      `json:"authenticators"`
+    Authorizer     Handler        `json:"authorizer"`
+    Mutators       []Handler      `json:"mutators"`
+    Errors         []ErrorHandler `json:"errors"`
+    Upstream       Upstream       `json:"upstream"`
+    matchingEngine MatchingEngine
+}
+
+type Handler struct {
+    Handler string          `json:"handler"`
+    Config  json.RawMessage `json:"config"`
+}
+```
+
+Hot-reload is supported via `rule.Fetcher` interface using `gocloud.dev/blob` (supports S3, GCS, filesystem):
+
+```go
+// rule/fetcher.go
+type Fetcher interface {
+    Watch(ctx context.Context) error
+}
+```
+
+### Credential-Proxy Static Config
+
+From `config/config.go` (lines 88--109):
+
+```go
+type Config struct {
+    Listener       ListenerConfig   `yaml:"listener"`
+    OIDC           OIDCConfig       `yaml:"oidc"`
+    OPA            OPAConfig        `yaml:"opa"`
+    Vault          VaultConfig      `yaml:"vault"`
+    Temporal       TemporalConfig   `yaml:"temporal"`
+    Credentials    []Credential     `yaml:"credentials"`
+    AllowedDomains []string         `yaml:"allowed_domains"`
+    CAKeyPath      string           `yaml:"ca_key_path"`
+    CACertPath     string           `yaml:"ca_cert_path"`
+    credentialIndex map[string]*Credential  // runtime
+    domainIndex     map[string]bool         // runtime
+}
+```
+
+**Assessment:** Oathkeeper's per-rule handler configuration, hot-reload, and pluggable config sources are overkill for our static YAML config. Our configuration is stable at startup and credentials are data, not policies. If we needed rule-based routing, we could adopt Oathkeeper's `Rule` and `Repository` patterns incrementally.
+
+---
+
+## Interface Design
+
+### Oathkeeper: Consistent 3-Method Pattern
+
+All handlers follow the same interface shape:
+
+```go
+// Authenticator
+type Authenticator interface {
+    Authenticate(r *http.Request, session *AuthenticationSession,
+        config json.RawMessage, rule pipeline.Rule) error
+    GetID() string
+    Validate(config json.RawMessage) error
+}
+
+// Authorizer
+type Authorizer interface {
+    Authorize(r *http.Request, session *authn.AuthenticationSession,
+        config json.RawMessage, rule pipeline.Rule) error
+    GetID() string
+    Validate(config json.RawMessage) error
+}
+
+// Mutator
+type Mutator interface {
+    Mutate(r *http.Request, session *authn.AuthenticationSession,
+        config json.RawMessage, _ pipeline.Rule) error
+    GetID() string
+    Validate(config json.RawMessage) error
+}
+```
+
+Session threading: authenticator populates session; authorizer reads session; mutators read and write session. Config separation: `json.RawMessage` parsed during `Validate`, not during the execution method.
+
+### Credential-Proxy: Single-Method Interfaces
+
+```go
+// authn/oidc.go:37-39
+type Verifier interface {
+    VerifyToken(ctx context.Context, rawToken string) (*AgentIdentity, error)
+}
+
+// authz/engine.go:42-44
+type Evaluator interface {
+    Evaluate(ctx context.Context, req *AuthzRequest) (*AuthzResult, error)
+}
+```
+
+These are simpler, context-aware, and use request/response types that capture intent.
+
+**Assessment:** Our single-method interfaces follow the Interface Segregation Principle correctly. The request/response pair types (`AuthzRequest` to `AuthzResult`) are more descriptive than Oathkeeper's monolithic session object. We should keep this simplicity unless scope expands to require `GetID()` and `Validate()` methods.
+
+---
+
+## Testing Patterns
+
+### Oathkeeper Unit Test Pattern
+
+From `pipeline/mutate/mutator_header_test.go` (lines 29--70):
+
+```go
+func TestCredentialsIssuerHeaders(t *testing.T) {
+    t.Parallel()
+    conf := internal.NewConfigurationWithDefaults(configx.SkipValidation())
+    reg := internal.NewRegistry(conf)
+
+    a, err := reg.PipelineMutator("header")
+    require.NoError(t, err)
+
+    t.Run("method=mutate", func(t *testing.T) {
+        var testMap = map[string]struct {
+            Session *authn.AuthenticationSession
+            Rule    *rule.Rule
+            Config  json.RawMessage
+            Request *http.Request
+            Match   http.Header
+            Err     error
+        }{
+            "Simple Subject": {
+                Session: &authn.AuthenticationSession{Subject: "foo"},
+                Rule:    &rule.Rule{ID: "test-rule"},
+                Config:  json.RawMessage(`{"headers":{"X-User": "{{ print .Subject }}"}}`),
+                Request: &http.Request{Header: http.Header{}},
+                Match:   http.Header{"X-User": []string{"foo"}},
+                Err:     nil,
+            },
+            "Complex Subject": {
+                Session: &authn.AuthenticationSession{Subject: "foo"},
+                Rule:    &rule.Rule{ID: "test-rule2"},
+                Config:  json.RawMessage(`{"headers":{"X-User": "realm:resources:users:{{ print .Subject }}"}}`),
+                Request: &http.Request{Header: http.Header{}},
+                Match:   http.Header{"X-User": []string{"realm:resources:users:foo"}},
+                Err:     nil,
+            },
+            // ...
+        }
+    })
+}
+```
+
+### Oathkeeper Integration Test Pattern
+
+From `proxy/proxy_test.go` (lines 29--100):
+
+```go
+func TestProxy(t *testing.T) {
+    backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprint(w, "authorization="+r.Header.Get("Authorization")+"\n")
+        fmt.Fprint(w, "host="+r.Host+"\n")
+    }))
+    defer backend.Close()
+
+    conf := internal.NewConfigurationWithDefaults()
+    reg := internal.NewRegistry(conf).WithBrokenPipelineMutator()
+
+    d := reg.Proxy()
+    ts := httptest.NewServer(&httputil.ReverseProxy{Rewrite: d.Rewrite, Transport: d})
+    defer ts.Close()
+
+    ruleNoOpAuthenticator := rule.Rule{
+        Match:          &rule.Match{Methods: []string{"GET"}, URL: ts.URL + "/authn-noop/<[0-9]+>"},
+        Authenticators: []rule.Handler{{Handler: "noop"}},
+        Authorizer:     rule.Handler{Handler: "allow"},
+        Mutators:       []rule.Handler{{Handler: "noop"}},
+        Upstream:       rule.Upstream{URL: backend.URL},
+    }
+    // ...
+}
+```
+
+**Key patterns:** Table-driven tests with named cases using map structs. Registry-based handler lookup in tests. Test servers via `httptest` for both backend and proxy. Mock handler support (e.g., `WithBrokenPipelineMutator`).
+
+**For credential-proxy:** We should adopt table-driven tests with named cases and separate unit tests (handler-level) from integration tests (gateway-level). Our existing interface-driven testing (`authn.Verifier`, `authz.Evaluator`) is already a good foundation.
+
+---
+
+## Summary: Patterns and Adoption Recommendations
+
+| Pattern | Oathkeeper | Credential-Proxy Status | Priority | Recommendation |
+|---------|-----------|------------------------|----------|---------------|
+| Handler Interface Design | 3-method (Do, GetID, Validate) | 1-method (Do) | Low | Keep 1-method; it is cleaner for our scope |
+| Config Validation | Separate `Validate()` method | At `Parse()` time | Medium | Defer unless multi-handler |
+| Session Threading | AuthenticationSession object | Direct context/fields | Low | Both approaches work |
+| Sentinel Errors | Herodot wrapped errors | Custom error types | None | Already adopted |
+| Request/Response Types | Session + Rule | AuthzRequest/AuthzResult | None | Already adopted |
+| Matching Engine | Lazy init, pluggable strategy | Static domain list | Medium | Adopt if adding URL patterns |
+| Rule Storage | Repository interface | YAML config | Low | Static config is fine |
+| Hot-Reload | RuleFetcher abstraction | N/A | Low | Not needed |
+| Error Handling | When-based conditional routing | Direct status codes | Low | Status codes sufficient |
+| Registry Pattern | Central Registry with sub-registries | DI in Gateway | Low | DI is simpler |
+| Template Caching | By rule+field | N/A | Low | Not needed |
+| Table-Driven Tests | Named map cases | To be adopted | High | Adopt for test clarity |
+
+---
+
+## Key Takeaways for Credential-Proxy
+
+### Current Design Strengths (Keep)
+
+- Single-method interfaces (`Verifier`, `Evaluator`) follow Interface Segregation correctly
+- Sentinel errors (`ErrTokenExpired`, `ErrInvalidIssuer`, `ErrInvalidAudience`) enable classification
+- Request/Response pair types (`AuthzRequest`/`AuthzResult`) are clean API contracts
+- Config validation at startup is correct for our static configuration model
+- Context threading with `context.Context` provides cancellation and timeout support
+
+### What Is Over-Engineered in Oathkeeper for Our Use Case
+
+1. **Fallback authenticator chain** -- we have a single OIDC authenticator
+2. **Error handler "When" matching** -- simple HTTP status codes suffice
+3. **Multiple mutators with template caching** -- we do direct placeholder replacement
+4. **Protocol abstraction** (HTTP vs gRPC) -- we only handle HTTPS via CONNECT
+5. **Rule repository with hot-reload** -- our config is static YAML
+6. **Matching engine strategy selection** (regexp vs glob) -- domain allowlist is enough
+7. **Handler registry with ID lookup** -- direct DI composition is simpler
+
+### Patterns to Adopt If Scope Expands
+
+**If adding URL pattern matching:**
+
+- Adopt Oathkeeper's URL pattern syntax: `https://domain.com/<pattern>` with `< >` delimiters
+- Implement lazy matching engine initialization (`ensureMatchingEngine` pattern)
+- Support both glob and regexp strategies behind a `MatchingEngine` interface
+
+**If adding multiple credential injection strategies:**
+
+```go
+type CredentialHandler interface {
+    Inject(r *http.Request, credential *Credential, value string) error
+    GetID() string
+    Validate(credential *Credential) error
+}
+```
+
+**If adding rule-based routing:**
+
+- Introduce `Rule` data structure with ID, Match, Credentials, Upstream
+- Implement `Repository` interface (List, Set, Get, Count)
+- Add rule fetcher for hot-reload support
+
+### Immediate Improvements (Low Effort, High Value)
+
+1. **Table-driven tests** -- adopt Oathkeeper's named map pattern for `gateway_test.go`
+2. **Error classification for HTTP status codes** -- use `errors.Is()` with sentinel errors in `handleRequest`:
+
+```go
+case errors.Is(err, authn.ErrTokenExpired):
+    return errorResponse(req, http.StatusUnauthorized, "token expired")
+case errors.Is(err, authn.ErrInvalidIssuer):
+    return errorResponse(req, http.StatusUnauthorized, "invalid issuer")
+```
+
+3. **Separate unit from integration tests** -- unit tests for `Verifier.VerifyToken` and `Evaluator.Evaluate` in isolation; integration tests for `Gateway` with `httptest` backends
+
+### Selective Adoption Strategy
+
+1. Keep credential-proxy's lightweight design
+2. Add table-driven testing framework (low effort, high clarity)
+3. Defer pattern adoption until scope expands (URL patterns, rule-based routing, multiple handlers)
+4. If expanding, adopt Oathkeeper patterns incrementally:
+   - Start with matching engine / rule repository
+   - Then handler registry / multi-handler support
+   - Never adopt: error handler "When" matching (too niche), protocol abstraction (HTTPS only)
