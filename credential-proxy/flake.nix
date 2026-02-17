@@ -14,7 +14,7 @@
         pname = "credential-proxy";
         version = "0.1.0";
         src = ./.;
-        vendorHash = null;
+        vendorHash = "sha256-eyypmSKcmsxFtMryc4TBK2SnXCVYTTld5Cwyi2PoRs8=";
 
         postInstall = ''
           mkdir -p $out/share/policies
