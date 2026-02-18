@@ -44,6 +44,29 @@ let
   caKeyPath = "${caDir}/ca.key";
   caCertPath = "${caDir}/ca.crt";
 
+  # Build-time CA for devMode — cert + key live in /nix/store.
+  # Key in the store is acceptable because dangerousDevMode is required.
+  # Production mode generates the CA at activation time (never in the store).
+  devModeCa = pkgs.runCommand "credproxy-dev-ca" {
+    nativeBuildInputs = [ pkgs.openssl ];
+  } ''
+    mkdir -p $out
+    openssl ecparam -genkey -name prime256v1 -noout -out $out/ca.key
+    openssl req -new -x509 -key $out/ca.key \
+      -out $out/ca.crt \
+      -days 3650 \
+      -subj "/CN=credproxy MITM CA (dev)/O=OpenClaw/OU=Credential Proxy"
+  '';
+
+  # Effective paths: devMode uses build-time Nix store paths,
+  # production uses runtime paths under /var/lib/credproxy/ca/.
+  effectiveCaKeyPath = if cfg.devMode.enable
+    then "${devModeCa}/ca.key"
+    else caKeyPath;
+  effectiveCaCertPath = if cfg.devMode.enable
+    then "${devModeCa}/ca.crt"
+    else caCertPath;
+
   # When devMode is enabled, override OIDC and vault URLs to point at the
   # local OpenBao dev server instead of external Keycloak / OpenBao instances.
   effectiveOidcIssuerURL = if cfg.devMode.enable
@@ -80,8 +103,8 @@ let
       namespace = "default";
       task_queue = "credproxy";
     };
-    ca_key_path = caKeyPath;
-    ca_cert_path = caCertPath;
+    ca_key_path = effectiveCaKeyPath;
+    ca_cert_path = effectiveCaCertPath;
     allowed_domains = cfg.allowedDomains;
     credentials = cfg.credentials;
   });
@@ -156,8 +179,7 @@ in
     caCertPath = mkOption {
       type = types.path;
       default = caCertPath;
-      description = "Runtime path to the MITM CA certificate (for guest trust store)";
-      readOnly = true;
+      description = "Path to the MITM CA certificate (for guest trust store). In devMode, this is a build-time Nix store path; in production, a runtime path managed by sops-nix.";
     };
   };
 
@@ -320,6 +342,10 @@ in
 
     # --- OpenBao dev mode services ---
     (mkIf cfg.devMode.enable {
+      # Override caCertPath to the build-time Nix store path so the guest
+      # can reference it in security.pki.certificateFiles at build time.
+      CUSTOM.virtualisation.openclaw-vm.credentialProxy.caCertPath = "${devModeCa}/ca.crt";
+
       # OpenBao dev server (in-memory, unsealed, root token pre-set)
       systemd.services.credproxy-openbao-dev = {
         description = "OpenBao Dev Server for Credential Proxy";
