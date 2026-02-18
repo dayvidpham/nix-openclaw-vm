@@ -94,12 +94,69 @@
       ];
     };
 
+    # Standalone boot-test VM — uses a different TAP, MAC, and VSOCK CID
+    # so it can run alongside the production openclaw-vm.
+    # Usage: nix build .#test-vm-boot && sudo ./result/bin/microvm-run
+    nixosConfigurations.test-vm-boot = nixpkgs.lib.nixosSystem {
+      inherit system;
+      specialArgs = {
+        pkgs-unstable = pkgs;
+        inherit nix-openclaw opencode credential-proxy;
+      };
+      modules = [
+        microvm.nixosModules.host
+        self.nixosModules.openclaw-vm
+        self.nixosModules.credential-proxy
+        {
+          CUSTOM.virtualisation.openclaw-vm = {
+            enable = true;
+            dangerousDevMode.enable = true;
+            useVirtiofs = true;
+            secrets.enable = false;
+            tailscale.enable = false;
+            caddy.enable = false;
+            memory = 4096;
+            vcpu = 2;
+
+            # Avoid conflicts with the running production VM
+            vsock.cid = 42;
+            network = {
+              tapInterface = "vm-oc-test";
+              macAddress = "02:00:00:00:00:42";
+            };
+
+            credentialProxy = {
+              enable = true;
+              devMode.enable = true;
+              allowedDomains = [ "httpbin.org" ];
+              credentials = [{
+                placeholder = "agent-vault-00000000-0000-0000-0000-000000000001";
+                type = "api_key";
+                vault_path = "secret/data/openclaw/credentials/httpbin";
+                bound_domain = "httpbin.org";
+                header_name = "Authorization";
+                header_prefix = "Bearer ";
+              }];
+            };
+          };
+
+          _module.check = false;
+          fileSystems."/" = { device = "/dev/vda"; fsType = "ext4"; };
+          boot.loader.grub.device = "/dev/vda";
+          networking.useDHCP = false;
+          system.stateVersion = "25.11";
+        }
+      ];
+    };
+
     devShells.${system}.default = credential-proxy.devShells.${system}.default;
 
     packages.${system} = {
       credential-proxy = credential-proxy.packages.${system}.credential-proxy;
       test-vm =
         self.nixosConfigurations.test-vm.config.microvm.vms.openclaw-vm.config.config.microvm.declaredRunner;
+      test-vm-boot =
+        self.nixosConfigurations.test-vm-boot.config.microvm.vms.openclaw-vm.config.config.microvm.declaredRunner;
     };
 
     checks.${system}.eval-test-vm = let

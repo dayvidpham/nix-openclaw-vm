@@ -117,6 +117,18 @@ in
         default = 24;
         description = "Network prefix length";
       };
+
+      tapInterface = mkOption {
+        type = types.str;
+        default = "vm-openclaw";
+        description = "TAP interface name on the host (must match host-side network config)";
+      };
+
+      macAddress = mkOption {
+        type = types.str;
+        default = "02:00:00:00:00:01";
+        description = "MAC address for the guest NIC";
+      };
     };
 
     # State volume configuration
@@ -758,8 +770,8 @@ in
       # TAP networking for proper isolation
       interfaces = [{
         type = "tap";
-        id = "vm-openclaw";
-        mac = "02:00:00:00:00:01";
+        id = cfg.network.tapInterface;
+        mac = cfg.network.macAddress;
       }];
 
       # Persistent state volume

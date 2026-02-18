@@ -241,7 +241,13 @@ in
       tapInterface = mkOption {
         type = types.str;
         default = "vm-openclaw";
-        description = "Name of the TAP interface (must match guest.nix)";
+        description = "Name of the TAP interface for host-guest networking";
+      };
+
+      macAddress = mkOption {
+        type = types.str;
+        default = "02:00:00:00:00:01";
+        description = "MAC address for the guest NIC";
       };
     };
   };
@@ -453,6 +459,8 @@ in
               vmAddress = cfg.network.vmAddress;
               gatewayAddress = lib.head (lib.splitString "/" cfg.network.bridgeAddress);
               prefixLength = lib.toInt (lib.last (lib.splitString "/" cfg.network.bridgeAddress));
+              tapInterface = cfg.network.tapInterface;
+              macAddress = cfg.network.macAddress;
             };
             # Pass vsock config to guest
             vsock = {
