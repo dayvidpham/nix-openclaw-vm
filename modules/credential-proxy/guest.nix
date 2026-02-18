@@ -301,7 +301,7 @@ in
             fi
             mkdir -p /run/credproxy
             cp /mnt/credproxy/oidc-client.env /run/credproxy/client-creds.env
-            chmod 0644 /run/credproxy/client-creds.env
+            chmod 0600 /run/credproxy/client-creds.env
           '';
           NoNewPrivileges = true;
           ProtectSystem = "strict";

@@ -366,6 +366,23 @@ in
           RemainAfterExit = true;
           User = "credproxy";
           Group = "credproxy";
+          # Allow writing /var/lib/credproxy (oidc-client.env); restrict everything else.
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/var/lib/credproxy" ];
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectHome = true;
+          ProtectKernelTunables = true;
+          ProtectKernelModules = true;
+          ProtectKernelLogs = true;
+          ProtectControlGroups = true;
+          RestrictNamespaces = true;
+          RestrictSUIDSGID = true;
+          LockPersonality = true;
+          CapabilityBoundingSet = "";
+          AmbientCapabilities = "";
+          SystemCallFilter = [ "@system-service" "~@privileged" "~@resources" ];
+          SystemCallArchitectures = "native";
         };
 
         script = let
@@ -377,13 +394,13 @@ in
           export BAO_ADDR="http://127.0.0.1:${port}"
           export BAO_TOKEN="${token}"
 
-          # Wait for OpenBao to be ready
-          for i in $(seq 1 30); do
+          # Wait for OpenBao to be ready (60 × 2s = 120s max, consistent with guest bridge)
+          for i in $(seq 1 60); do
             if bao status >/dev/null 2>&1; then
               break
             fi
-            echo "Waiting for OpenBao to be ready... ($i/30)"
-            sleep 1
+            echo "Waiting for OpenBao to be ready... ($i/60)"
+            sleep 2
           done
 
           # --- OIDC Identity Provider ---
@@ -409,14 +426,19 @@ in
           bao write identity/oidc/scope/credproxy-scope \
             template='{"realm_access":{"roles":["credproxy-user"]},"groups":["openclaw-agents"]}'
 
-          # 6. Create confidential OIDC client
+          # 6. Create confidential OIDC client.
+          # Use cfg.oidcAudience as the static client_id so that JWTs emitted by
+          # OpenBao have aud=[<client_id>] that matches the credproxy config at
+          # evaluation time.  Without this, OpenBao generates a random UUID client_id
+          # which can never match the static oidcAudience option.
+          CLIENT_ID="${cfg.oidcAudience}"
           CLIENT_OUTPUT=$(bao write -format=json identity/oidc/client/credproxy \
             key=credproxy-key \
             assignments=credproxy-assignment \
             client_type=confidential \
+            client_id="$CLIENT_ID" \
             id_token_ttl=1h \
             access_token_ttl=1h)
-          CLIENT_ID=$(echo "$CLIENT_OUTPUT" | jq -r '.data.client_id')
           CLIENT_SECRET=$(echo "$CLIENT_OUTPUT" | jq -r '.data.client_secret')
 
           # 7. Create OIDC provider
@@ -442,6 +464,39 @@ in
 
           echo "OpenBao provisioning complete: OIDC + KV v2 configured"
         '';
+      };
+
+      # Host-side VSOCK listener: exposes OpenBao to the guest VM.
+      # The guest runs credproxy-openbao-bridge (VSOCK-CONNECT:2:8200 → TCP:localhost:8200).
+      # For that to work, the host must accept VSOCK connections on port 8200 and forward
+      # them to the local OpenBao dev server.  Without this listener the guest gets ECONNREFUSED.
+      systemd.services.credproxy-openbao-vsock = {
+        description = "VSOCK Listener: expose OpenBao to guest VM";
+        after = [ "credproxy-openbao-dev.service" ];
+        requires = [ "credproxy-openbao-dev.service" ];
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "simple";
+          ExecStart = "${pkgs.socat}/bin/socat VSOCK-LISTEN:${toString cfg.devMode.openbaoPort},fork TCP:localhost:${toString cfg.devMode.openbaoPort}";
+          Restart = "always";
+          RestartSec = "1s";
+
+          # VSOCK listener needs /dev/vsock device access
+          PrivateDevices = false;
+          DeviceAllow = [ "/dev/vsock rw" ];
+
+          # Hardening — network bridge only
+          DynamicUser = true;
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          RestrictNamespaces = true;
+          RestrictSUIDSGID = true;
+          CapabilityBoundingSet = "";
+          SystemCallFilter = [ "@system-service" "~@privileged" ];
+          SystemCallArchitectures = "native";
+        };
       };
 
       # Wire credproxy to start after provisioning completes
