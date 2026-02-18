@@ -122,8 +122,10 @@ in
     {
       assertions = [
         {
-          assertion = cfg.caCertFile != null;
-          message = "credentialProxy.caCertFile must be set when credentialProxy is enabled. The MITM CA cert is required for TLS trust.";
+          # In devMode the CA cert is delivered at runtime via virtiofs,
+          # so caCertFile (a build-time path) is not required.
+          assertion = cfg.devMode.enable || cfg.caCertFile != null;
+          message = "credentialProxy.caCertFile must be set when credentialProxy is enabled (unless devMode is active). The MITM CA cert is required for TLS trust.";
         }
       ];
 
@@ -155,8 +157,10 @@ in
 
       # Install MITM CA cert in system trust store so TLS verification passes
       # through the credential proxy's MITM interception.
-      # (assertion above guarantees caCertFile is non-null when enabled)
-      security.pki.certificateFiles = [ cfg.caCertFile ];
+      # In devMode the cert is delivered at runtime via virtiofs instead (see below).
+      security.pki.certificateFiles = mkIf
+        (!cfg.devMode.enable && cfg.caCertFile != null)
+        [ cfg.caCertFile ];
 
       # Client scripts for credential proxy interaction (auth + request wrapper)
       environment.systemPackages = [
@@ -249,6 +253,56 @@ in
 
     # --- Dev mode guest services ---
     (mkIf cfg.devMode.enable {
+      # Runtime CA trust: the host generates the MITM CA key+cert at activation
+      # time (credproxy-ca-init), and the virtiofs share exposes it to the guest
+      # at /mnt/credproxy/ca/ca.crt.  We poll for the cert, then build a combined
+      # CA bundle so TLS clients trust the proxy without any secret in /nix/store.
+      systemd.services.credproxy-ca-trust = {
+        description = "Install credproxy MITM CA from virtiofs into runtime trust store";
+        after = [ "local-fs.target" ];
+        before = [ "multi-user.target" ];
+        wantedBy = [ "multi-user.target" ];
+
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = pkgs.writeShellScript "credproxy-ca-trust-init" ''
+            set -euo pipefail
+            # Wait for host CA cert to appear on virtiofs share
+            for i in $(seq 1 60); do
+              if [ -f /mnt/credproxy/ca/ca.crt ]; then
+                break
+              fi
+              echo "Waiting for credproxy CA cert on virtiofs... ($i/60)"
+              sleep 2
+            done
+            if [ ! -f /mnt/credproxy/ca/ca.crt ]; then
+              echo "error: /mnt/credproxy/ca/ca.crt not found after 2 minutes" >&2
+              exit 1
+            fi
+            mkdir -p /run/credproxy
+            # Combine the system CA bundle with the credproxy MITM cert
+            cat /etc/ssl/certs/ca-certificates.crt /mnt/credproxy/ca/ca.crt \
+              > /run/credproxy/ca-bundle.crt
+            chmod 0644 /run/credproxy/ca-bundle.crt
+            echo "credproxy CA installed in runtime trust bundle"
+          '';
+          NoNewPrivileges = true;
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/run/credproxy" ];
+        };
+      };
+
+      # Point all TLS libraries at the runtime CA bundle that includes the
+      # credproxy MITM cert.  This covers curl, Python requests, Go net/http,
+      # Node.js, and most OpenSSL-based tools.
+      environment.variables = {
+        SSL_CERT_FILE = "/run/credproxy/ca-bundle.crt";
+        CURL_CA_BUNDLE = "/run/credproxy/ca-bundle.crt";
+        REQUESTS_CA_BUNDLE = "/run/credproxy/ca-bundle.crt";
+        NODE_EXTRA_CA_CERTS = "/run/credproxy/ca-bundle.crt";
+      };
+
       # VSOCK bridge to OpenBao for OIDC auth (devMode only)
       # The host runs OpenBao dev server on port 8200; this bridge makes
       # it accessible to the guest at localhost:8200 via VSOCK CID 2.
