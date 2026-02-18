@@ -61,6 +61,20 @@
             caddy.enable = false;
             memory = 4096;
             vcpu = 2;
+
+            credentialProxy = {
+              enable = true;
+              devMode.enable = true;
+              allowedDomains = [ "httpbin.org" ];
+              credentials = [{
+                placeholder = "agent-vault-00000000-0000-0000-0000-000000000001";
+                type = "api_key";
+                vault_path = "secret/data/openclaw/credentials/httpbin";
+                bound_domain = "httpbin.org";
+                header_name = "Authorization";
+                header_prefix = "Bearer ";
+              }];
+            };
           };
 
           # Suppress unknown-option errors for sops.* paths defined in

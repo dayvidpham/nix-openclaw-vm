@@ -450,5 +450,21 @@ in
         requires = [ "credproxy-openbao-provision.service" ];
       };
     })
+
+    # devMode guest wiring: virtiofs share for runtime OIDC credentials + guest devMode config
+    (mkIf cfg.devMode.enable (optionalAttrs hasMicrovm {
+      microvm.vms.openclaw-vm.config = {
+        # Share /var/lib/credproxy from host to guest so the guest can read
+        # oidc-client.env (written at runtime by the provisioning script).
+        microvm.shares = [{
+          tag = "credproxy-state";
+          source = "/var/lib/credproxy";
+          mountPoint = "/mnt/credproxy";
+          proto = "virtiofs";
+        }];
+        # Enable devMode on the guest (auto-configures VSOCK bridge + token URL)
+        CUSTOM.virtualisation.openclaw-vm.guest.credentialProxy.devMode.enable = true;
+      };
+    }))
   ]);
 }

@@ -18,10 +18,17 @@ let
 
   inherit (lib)
     mkIf
+    mkMerge
     mkOption
     mkEnableOption
     types
     ;
+
+  # When devMode is enabled, auto-derive the OIDC token endpoint URL
+  # from the guest-side VSOCK bridge to OpenBao at localhost:8200.
+  effectiveTokenURL = if cfg.devMode.enable
+    then "http://localhost:8200/v1/identity/oidc/provider/credproxy/token"
+    else cfg.tokenURL;
 
   # Guest-side client scripts for credential proxy interaction.
   # writeShellApplication provides bash shebang, set -euo pipefail,
@@ -41,6 +48,10 @@ in
   options.CUSTOM.virtualisation.openclaw-vm.guest.credentialProxy = {
     enable = mkEnableOption "Credential proxy client in guest VM";
 
+    devMode = {
+      enable = mkEnableOption "Dev mode guest configuration (OpenBao VSOCK bridge, auto-config)";
+    };
+
     localPort = mkOption {
       type = types.port;
       default = 18790;
@@ -59,10 +70,16 @@ in
       description = "Path to the credential proxy MITM CA certificate for trust store installation";
     };
 
+    tokenURL = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      description = "OIDC token endpoint URL for authentication (IdP-agnostic, replaces keycloakURL)";
+    };
+
     keycloakURL = mkOption {
       type = types.nullOr types.str;
       default = null;
-      description = "Keycloak token endpoint URL for OIDC authentication";
+      description = "Legacy: Keycloak token endpoint URL (use tokenURL instead)";
     };
 
     clientId = mkOption {
@@ -101,125 +118,196 @@ in
     };
   };
 
-  config = mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = cfg.caCertFile != null;
-        message = "credentialProxy.caCertFile must be set when credentialProxy is enabled. The MITM CA cert is required for TLS trust.";
-      }
-    ];
+  config = mkIf cfg.enable (mkMerge [
+    {
+      assertions = [
+        {
+          assertion = cfg.caCertFile != null;
+          message = "credentialProxy.caCertFile must be set when credentialProxy is enabled. The MITM CA cert is required for TLS trust.";
+        }
+      ];
 
-    # socat VSOCK bridge: forwards local TCP to host's credential proxy via VSOCK
-    # CID 2 = host
-    systemd.services.credproxy-vsock-bridge = {
-      description = "VSOCK Bridge to Credential Proxy";
-      after = [ "network.target" ];
-      wantedBy = [ "multi-user.target" ];
+      # socat VSOCK bridge: forwards local TCP to host's credential proxy via VSOCK
+      # CID 2 = host
+      systemd.services.credproxy-vsock-bridge = {
+        description = "VSOCK Bridge to Credential Proxy";
+        after = [ "network.target" ];
+        wantedBy = [ "multi-user.target" ];
 
-      serviceConfig = {
-        Type = "simple";
-        ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:${toString cfg.localPort},fork,reuseaddr VSOCK-CONNECT:2:${toString cfg.vsockPort}";
-        Restart = "always";
-        RestartSec = "1s";
+        serviceConfig = {
+          Type = "simple";
+          ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:${toString cfg.localPort},fork,reuseaddr VSOCK-CONNECT:2:${toString cfg.vsockPort}";
+          Restart = "always";
+          RestartSec = "1s";
 
-        # Hardening — network proxy only
-        DynamicUser = true;
-        NoNewPrivileges = true;
-        PrivateTmp = true;
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        RestrictNamespaces = true;
-        RestrictSUIDSGID = true;
-        CapabilityBoundingSet = "";
-        SystemCallFilter = [ "@system-service" "~@privileged" ];
+          # Hardening — network proxy only
+          DynamicUser = true;
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          RestrictNamespaces = true;
+          RestrictSUIDSGID = true;
+          CapabilityBoundingSet = "";
+          SystemCallFilter = [ "@system-service" "~@privileged" ];
+        };
       };
-    };
 
-    # Install MITM CA cert in system trust store so TLS verification passes
-    # through the credential proxy's MITM interception.
-    # (assertion above guarantees caCertFile is non-null when enabled)
-    security.pki.certificateFiles = [ cfg.caCertFile ];
+      # Install MITM CA cert in system trust store so TLS verification passes
+      # through the credential proxy's MITM interception.
+      # (assertion above guarantees caCertFile is non-null when enabled)
+      security.pki.certificateFiles = [ cfg.caCertFile ];
 
-    # Client scripts for credential proxy interaction (auth + request wrapper)
-    environment.systemPackages = [
-      credproxy-auth
-      credproxy-request
-    ];
+      # Client scripts for credential proxy interaction (auth + request wrapper)
+      environment.systemPackages = [
+        credproxy-auth
+        credproxy-request
+      ];
 
-    # Proxy env vars: use environment.variables so systemd services also get them
-    environment.variables = {
-      HTTP_PROXY = "http://localhost:${toString cfg.localPort}";
-      HTTPS_PROXY = "http://localhost:${toString cfg.localPort}";
-      NO_PROXY = "localhost,127.0.0.1";
-    } // cfg.placeholderEnvVars;
+      # Proxy env vars: use environment.variables so systemd services also get them
+      environment.variables = {
+        HTTP_PROXY = "http://localhost:${toString cfg.localPort}";
+        HTTPS_PROXY = "http://localhost:${toString cfg.localPort}";
+        NO_PROXY = "localhost,127.0.0.1";
+      } // cfg.placeholderEnvVars;
 
-    # CREDPROXY_TOKEN_FILE uses XDG_RUNTIME_DIR which must be evaluated at
-    # login time, not build time — set via a profile.d snippet.
-    environment.etc."profile.d/credproxy-token.sh" = {
-      text = ''
-        export CREDPROXY_TOKEN_FILE="''${XDG_RUNTIME_DIR:-/tmp}/credproxy-jwt"
-      '';
-    };
+      # CREDPROXY_TOKEN_FILE uses XDG_RUNTIME_DIR which must be evaluated at
+      # login time, not build time — set via a profile.d snippet.
+      environment.etc."profile.d/credproxy-token.sh" = {
+        text = ''
+          export CREDPROXY_TOKEN_FILE="''${XDG_RUNTIME_DIR:-/tmp}/credproxy-jwt"
+        '';
+      };
+
+      # Generate /etc/credproxy/client.env for credproxy-auth
+      # Supports both tokenURL (preferred) and keycloakURL (legacy fallback)
+      environment.etc."credproxy/client.env" = mkIf (effectiveTokenURL != null || cfg.keycloakURL != null) {
+        text = lib.concatStringsSep "\n" (
+          lib.optional (effectiveTokenURL != null)
+            "CREDPROXY_TOKEN_URL=${lib.escapeShellArg effectiveTokenURL}"
+          ++ lib.optional (cfg.keycloakURL != null && effectiveTokenURL == null)
+            "CREDPROXY_KEYCLOAK_URL=${lib.escapeShellArg cfg.keycloakURL}"
+          ++ lib.optional (cfg.clientId != null)
+            "CREDPROXY_CLIENT_ID=${lib.escapeShellArg cfg.clientId}"
+          ++ lib.optional (cfg.clientSecretFile != null)
+            "CREDPROXY_CLIENT_SECRET_FILE=${lib.escapeShellArg (toString cfg.clientSecretFile)}"
+          ++ [ "" ]
+        );
+        mode = "0644";
+      };
+    }
 
     # fw_cfg → env var boot service.
     # Reads the credproxy-placeholder-env credential (provided by the host via
     # microvm.credentialFiles / QEMU fw_cfg) and writes each env_var=placeholder pair
     # to /run/credproxy/placeholder.env. A profile.d snippet then sources that file
     # at login time so agents see the placeholder tokens without any static Nix config.
-    systemd.services.credproxy-placeholder-env = mkIf cfg.fwCfg.enable {
-      description = "Populate credential placeholder env vars from fw_cfg";
-      wantedBy = [ "multi-user.target" ];
-      before = [ "multi-user.target" ];
+    (mkIf cfg.fwCfg.enable {
+      systemd.services.credproxy-placeholder-env = {
+        description = "Populate credential placeholder env vars from fw_cfg";
+        wantedBy = [ "multi-user.target" ];
+        before = [ "multi-user.target" ];
 
-      serviceConfig = {
-        Type = "oneshot";
-        RemainAfterExit = true;
-        # Import the fw_cfg credential into $CREDENTIALS_DIRECTORY
-        ImportCredential = "credproxy-placeholder-env";
-        ExecStart = pkgs.writeShellScript "credproxy-placeholder-env-init" ''
-          set -euo pipefail
-          mkdir -p /run/credproxy
-          ${pkgs.jq}/bin/jq -r \
-            '.placeholders[] | "\(.env_var)=\(.placeholder)"' \
-            "$CREDENTIALS_DIRECTORY/credproxy-placeholder-env" \
-            > /run/credproxy/placeholder.env
-          chmod 0644 /run/credproxy/placeholder.env
-        '';
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          # Import the fw_cfg credential into $CREDENTIALS_DIRECTORY
+          ImportCredential = "credproxy-placeholder-env";
+          ExecStart = pkgs.writeShellScript "credproxy-placeholder-env-init" ''
+            set -euo pipefail
+            mkdir -p /run/credproxy
+            ${pkgs.jq}/bin/jq -r \
+              '.placeholders[] | "\(.env_var)=\(.placeholder)"' \
+              "$CREDENTIALS_DIRECTORY/credproxy-placeholder-env" \
+              > /run/credproxy/placeholder.env
+            chmod 0644 /run/credproxy/placeholder.env
+          '';
 
-        # Minimal hardening for a boot-time oneshot
-        NoNewPrivileges = true;
-        ProtectSystem = "strict";
-        ReadWritePaths = [ "/run/credproxy" ];
+          # Minimal hardening for a boot-time oneshot
+          NoNewPrivileges = true;
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/run/credproxy" ];
+        };
       };
-    };
 
-    # Source placeholder env vars at login time for interactive shells and agent processes.
-    # This is the guest-side companion to fwCfg: agents see the tokens without any
-    # static configuration baked into the Nix closure.
-    environment.etc."profile.d/credproxy-placeholder-env.sh" = mkIf cfg.fwCfg.enable {
-      text = ''
-        # Credential placeholder env vars — written at boot by credproxy-placeholder-env.service
-        if [[ -r /run/credproxy/placeholder.env ]]; then
-          set -a
-          # shellcheck source=/dev/null
-          source /run/credproxy/placeholder.env
-          set +a
-        fi
-      '';
-      mode = "0644";
-    };
+      # Source placeholder env vars at login time for interactive shells and agent processes.
+      # This is the guest-side companion to fwCfg: agents see the tokens without any
+      # static configuration baked into the Nix closure.
+      environment.etc."profile.d/credproxy-placeholder-env.sh" = {
+        text = ''
+          # Credential placeholder env vars — written at boot by credproxy-placeholder-env.service
+          if [[ -r /run/credproxy/placeholder.env ]]; then
+            set -a
+            # shellcheck source=/dev/null
+            source /run/credproxy/placeholder.env
+            set +a
+          fi
+        '';
+        mode = "0644";
+      };
+    })
 
-    # Generate /etc/credproxy/client.env for credproxy-auth when Keycloak is configured
-    environment.etc."credproxy/client.env" = mkIf (cfg.keycloakURL != null) {
-      text = lib.concatStringsSep "\n" (
-        [ "CREDPROXY_KEYCLOAK_URL=${lib.escapeShellArg cfg.keycloakURL}" ]
-        ++ lib.optional (cfg.clientId != null)
-          "CREDPROXY_CLIENT_ID=${lib.escapeShellArg cfg.clientId}"
-        ++ lib.optional (cfg.clientSecretFile != null)
-          "CREDPROXY_CLIENT_SECRET_FILE=${lib.escapeShellArg (toString cfg.clientSecretFile)}"
-        ++ [ "" ]
-      );
-      mode = "0644";
-    };
-  };
+    # --- Dev mode guest services ---
+    (mkIf cfg.devMode.enable {
+      # VSOCK bridge to OpenBao for OIDC auth (devMode only)
+      # The host runs OpenBao dev server on port 8200; this bridge makes
+      # it accessible to the guest at localhost:8200 via VSOCK CID 2.
+      systemd.services.credproxy-openbao-bridge = {
+        description = "VSOCK Bridge to OpenBao for OIDC auth";
+        after = [ "network.target" ];
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "simple";
+          ExecStart = "${pkgs.socat}/bin/socat TCP-LISTEN:8200,fork,reuseaddr VSOCK-CONNECT:2:8200";
+          Restart = "always";
+          RestartSec = "1s";
+          DynamicUser = true;
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          RestrictNamespaces = true;
+          RestrictSUIDSGID = true;
+          CapabilityBoundingSet = "";
+          SystemCallFilter = [ "@system-service" "~@privileged" ];
+        };
+      };
+
+      # Load OIDC client credentials from host virtiofs share.
+      # The host provisioning script writes oidc-client.env to /var/lib/credproxy/
+      # which is shared to the guest at /mnt/credproxy via virtiofs.
+      # This service polls until the file appears (provisioning may still be running)
+      # then copies it to /run/credproxy/client-creds.env for credproxy-auth to source.
+      systemd.services.credproxy-oidc-creds = {
+        description = "Load OIDC client credentials from host virtiofs share";
+        after = [ "local-fs.target" "credproxy-openbao-bridge.service" ];
+        wantedBy = [ "multi-user.target" ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = pkgs.writeShellScript "credproxy-oidc-creds-init" ''
+            set -euo pipefail
+            # Wait for provisioning to complete (file appears on virtiofs share)
+            for i in $(seq 1 60); do
+              if [ -f /mnt/credproxy/oidc-client.env ]; then
+                break
+              fi
+              echo "Waiting for OIDC client credentials... ($i/60)"
+              sleep 2
+            done
+            if [ ! -f /mnt/credproxy/oidc-client.env ]; then
+              echo "error: /mnt/credproxy/oidc-client.env not found after 2 minutes" >&2
+              exit 1
+            fi
+            mkdir -p /run/credproxy
+            cp /mnt/credproxy/oidc-client.env /run/credproxy/client-creds.env
+            chmod 0644 /run/credproxy/client-creds.env
+          '';
+          NoNewPrivileges = true;
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/run/credproxy" ];
+        };
+      };
+    })
+  ]);
 }
