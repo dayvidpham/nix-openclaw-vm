@@ -119,6 +119,13 @@ nix build .#test-vm && ./result/bin/microvm-run
 ```
 The `test-vm` config has `dangerousDevMode` enabled and sops/Tailscale/Caddy disabled, so it boots without external infrastructure.
 
+**Isolated boot test** (can run alongside the production VM):
+```bash
+nix build .#test-vm-boot
+sudo ./scripts/test-vm-boot.sh
+```
+Uses VSOCK CID 42, TAP `vm-oc-test`, MAC `02:00:00:00:00:42` — no conflicts with `test-vm`.
+
 ### Test package map
 
 | Package | Type | What it covers |
@@ -178,7 +185,7 @@ For the full model documentation — actor-to-file correspondence, variable mapp
 
 ### VSOCK testing
 
-The VSOCK transport between VM guest and host is exercised only in a live VM boot (`nix build .#test-vm && ./result/bin/microvm-run`). For isolated VSOCK channel testing without a full boot, use `socat`:
+The VSOCK transport between VM guest and host is exercised only in a live VM boot (`nix build .#test-vm && ./result/bin/microvm-run`). The `test-vm-boot` variant (`nix build .#test-vm-boot && sudo ./scripts/test-vm-boot.sh`) can run alongside the production VM for side-by-side testing. For isolated VSOCK channel testing without a full boot, use `socat`:
 
 ```bash
 # Emulate host side (listens on VSOCK CID 2, port 8080)
