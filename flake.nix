@@ -27,8 +27,12 @@
   in {
     nixosModules = {
       openclaw = ./modules/openclaw;
-      openclaw-vm = ./modules/openclaw-vm;
-      openclaw-vm-guest = ./modules/openclaw-vm/guest.nix;
+      openclaw-vm = { imports = [
+        ./modules/openclaw-vm
+      ]; _module.args = { inherit nix-openclaw opencode; }; };
+      openclaw-vm-guest = { imports = [
+        ./modules/openclaw-vm/guest.nix
+      ]; _module.args = { inherit nix-openclaw opencode; }; };
       credential-proxy = { imports = [
         ./modules/credential-proxy
       ]; _module.args.credential-proxy = credential-proxy; };
