@@ -2,5 +2,5 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "server",
-  "dolt_database": "nix_openclaw_vm"
+  "dolt_database": "nix-openclaw-vm"
 }
